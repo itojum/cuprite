@@ -4,6 +4,7 @@ require "prism"
 require_relative "ir"
 require_relative "frontend"
 require_relative "types"
+require_relative "call_graph"
 require_relative "codegen"
 require_relative "runtime"
 
@@ -30,9 +31,9 @@ module Cuprite
       end
 
       program = Frontend.new(file: @file).build(result.value)
-      types = Types.infer(program)
+      types = Types.infer(program, file: @file)
       pack = Pack.new(names.ns)
-      codegen = Codegen.new(program, types, names, pack, test_mode: @test_mode)
+      codegen = Codegen.new(program, types, names, pack, test_mode: @test_mode, file: @file)
       codegen.generate
       Runtime.new(program, names, pack, codegen, debug: @debug).generate
       pack

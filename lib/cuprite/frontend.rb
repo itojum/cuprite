@@ -13,13 +13,29 @@ module Cuprite
       @file = file
     end
 
+    # Kernel control constructs (design §9.0) and built-ins that user
+    # methods may not shadow (design §4.5).
+    RESERVED = %w[main wait sleep next_tick wait_until as at positioned rotated execute
+                  puts p raise loop].freeze
+
     def build(root)
       @program = IR::Program.new
       main = IR::Function.new("main", kind: :main, line: 1)
       @program.add_function(main)
+      @defs = {}
+      root.statements.body.each { |stmt| declare_method(stmt) if stmt.is_a?(Prism::DefNode) }
+
       with_function(main) do
         compile_body(root.statements, used: false)
         emit IR::Return.new(src: IR::Const.nil)
+      end
+      @defs.each do |name, node|
+        fn = @program.functions.fetch(name)
+        with_function(fn) do
+          @line = node.location.start_line
+          value = compile_method_body(node.body)
+          emit IR::Return.new(src: value)
+        end
       end
       @program
     end
@@ -75,6 +91,100 @@ module Cuprite
       node.respond_to?(:subsequent) ? node.subsequent : node.consequent
     end
 
+    # --- Methods -----------------------------------------------------------
+
+    def declare_method(node)
+      @line = node.location.start_line
+      name = node.name.to_s
+      error("methods with a receiver (def self.#{name}) are not supported", node) if node.receiver
+      if RESERVED.include?(name) || name.start_with?("__")
+        error("'#{name}' is reserved and cannot be defined as a method", node)
+      end
+      error("method '#{name}' is defined twice", node) if @defs.key?(name)
+
+      kind = { "on_load" => :on_load, "on_tick" => :on_tick }.fetch(name, :method)
+      params, defaults = method_params(node, name)
+      error("#{name} cannot take parameters", node) if kind != :method && !params.empty?
+
+      fn = IR::Function.new(name, kind: kind, line: node.location.start_line)
+      params.each { |pname| fn.params << fn.local(pname) }
+      fn.defaults = defaults
+      @program.add_function(fn)
+      @defs[name] = node
+    end
+
+    # Required and optional parameters. Optional parameters need literal
+    # defaults, filled in by the caller.
+    def method_params(node, name)
+      ps = node.parameters
+      return [[], []] if ps.nil?
+
+      unsupported = ps.rest || !ps.posts.empty? || !ps.keywords.empty? || ps.keyword_rest || ps.block
+      error("#{name}: only required and optional positional parameters are supported", node) if unsupported
+
+      names = ps.requireds.map do |r|
+        error("#{name}: destructuring parameters are not supported", r) unless r.is_a?(Prism::RequiredParameterNode)
+
+        r.name.to_s
+      end
+      defaults = Array.new(names.size)
+      ps.optionals.each do |o|
+        default = with_function(IR::Function.new("(default)", kind: :method)) { compile_expr(o.value) }
+        error("#{name}: default value of #{o.name} must be a literal", o) unless default.is_a?(IR::Const)
+
+        names << o.name.to_s
+        defaults << default
+      end
+      [names, defaults]
+    end
+
+    def compile_method_body(body)
+      case body
+      when nil then IR::Const.nil
+      when Prism::BeginNode then compile_begin(body, used: true)
+      else compile_body(body, used: true)
+      end
+    end
+
+    def compile_begin(node, used:)
+      error("rescue / ensure are not supported yet", node) if node.rescue_clause || node.ensure_clause || node.else_clause
+
+      compile_body(node.statements, used: used)
+    end
+
+    def compile_return(node)
+      args = node.arguments&.arguments || []
+      error("returning several values is not supported", node) if args.size > 1
+      value = args.empty? ? IR::Const.nil : compile_expr(args.first)
+      value = IR::Const.nil if @fn.entry_point?
+      emit IR::Return.new(src: value)
+      IR::Const.nil
+    end
+
+    def compile_method_call(node, name, args)
+      fn = @program.functions[name.to_s]
+      return nil if fn.nil? || fn.kind == :main
+
+      error("#{name} does not take a block", node) if node.block
+      min = fn.defaults.count(&:nil?)
+      unless args.size.between?(min, fn.params.size)
+        expected = min == fn.params.size ? min.to_s : "#{min}..#{fn.params.size}"
+        error("wrong number of arguments for #{name} (given #{args.size}, expected #{expected})", node)
+      end
+      ops = args.map do |a|
+        error("splat and keyword arguments are not supported", a) unless a.is_a?(Prism::Node) && !a.is_a?(Prism::SplatNode) && !a.is_a?(Prism::KeywordHashNode)
+
+        v = compile_expr(a)
+        # A self-call assigns this frame's own parameters, so later arguments
+        # must not read a parameter that an earlier one has overwritten.
+        fn.name == @fn.name ? stable(v) : v
+      end
+      ops += fn.defaults[args.size..]
+      dst = @fn.temp
+      emit IR::Call.new(dst: dst, fn: fn.name, args: ops)
+      dst
+    end
+
     # --- Statements and expressions ---------------------------------------
 
     # Compiles a StatementsNode (or nil) and returns the operand holding the
@@ -122,6 +232,12 @@ module Cuprite
       when Prism::ElseNode then compile_body(node.statements, used: used)
       when Prism::CaseNode then compile_case(node, used: used)
       when Prism::CallNode then compile_call(node, used: used)
+      when Prism::DefNode
+        error("methods can only be defined at the top level", node) unless @fn.kind == :main && @block.equal?(@fn.body)
+
+        IR::Const.nil
+      when Prism::ReturnNode then compile_return(node)
+      when Prism::BeginNode then compile_begin(node, used: used)
       when Prism::StringNode, Prism::InterpolatedStringNode
         error("strings are only supported as arguments to puts, p and raise", node)
       else
@@ -371,11 +487,13 @@ module Cuprite
         end
       end
 
-      if recv.nil?
+      if recv.nil? || recv.is_a?(Prism::SelfNode)
         case name
         when :puts then return compile_print(node, args, :puts)
         when :p then return compile_print(node, args, :p, used: used)
         end
+        result = compile_method_call(node, name, args)
+        return result if result
       end
 
       error("undefined method '#{name}'", node)

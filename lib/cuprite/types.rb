@@ -14,6 +14,7 @@ module Cuprite
       @file = file
       @types = Hash.new { |h, k| h[k] = Set.new }
       @returns = Hash.new { |h, k| h[k] = Set.new }
+      @lines = {} # slot or [:return, fn] => line where a conflicting type arrived
     end
 
     # Type of an operand.
@@ -47,14 +48,22 @@ module Cuprite
     def add(slot, type_set)
       before = @types[slot].size
       @types[slot].merge(type_set)
-      @changed = true if @types[slot].size != before
+      return if @types[slot].size == before
+
+      @changed = true
+      @lines[slot] ||= @line if conflict?(@types[slot])
     end
 
     def add_return(fn_name, type_set)
       before = @returns[fn_name].size
       @returns[fn_name].merge(type_set)
-      @changed = true if @returns[fn_name].size != before
+      return if @returns[fn_name].size == before
+
+      @changed = true
+      @lines[[:return, fn_name]] ||= @line if conflict?(@returns[fn_name])
     end
+
+    def conflict?(t) = t.include?(:int) && t.include?(:bool)
 
     def visit_function(fn)
       # Unassigned globals read as nil, and globals persist across runs.
@@ -64,25 +73,31 @@ module Cuprite
     end
 
     def visit(fn, ins)
+      @line = ins.line
       case ins
       when IR::Move then add(ins.dst, of(ins.src))
       when IR::Arith then add(ins.dst, [:int])
       when IR::Compare, IR::InRange, IR::Not then add(ins.dst, [:bool])
-      when IR::Return then add_return(fn.name, of(ins.src))
+      when IR::Return then add_return(fn.name, fn.entry_point? ? [:nil] : of(ins.src))
+      when IR::Call
+        callee = @program.functions.fetch(ins.fn)
+        callee.params.zip(ins.args).each { |param, arg| add(param, of(arg)) }
+        add(ins.dst, return_type(ins.fn))
       end
     end
 
     def check
+      @returns.each do |name, t|
+        next unless conflict?(t)
+
+        raise CompileError.new("method #{name} may return both Integer and true/false",
+                               file: @file, line: @lines[[:return, name]])
+      end
       @types.each do |slot, t|
-        next unless t.include?(:int) && t.include?(:bool)
+        next unless conflict?(t)
 
         raise CompileError.new("#{describe(slot)} may hold both Integer and true/false, which cannot be represented",
-                               file: @file)
-      end
-      @returns.each do |name, t|
-        next unless t.include?(:int) && t.include?(:bool)
-
-        raise CompileError.new("method #{name} may return both Integer and true/false", file: @file)
+                               file: @file, line: @lines[slot])
       end
     end
 
