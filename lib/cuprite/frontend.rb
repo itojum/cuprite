@@ -185,6 +185,8 @@ module Cuprite
       @line = node.location.start_line
       name = constant_name(node.constant_path)
       superclass = node.superclass && constant_name(node.superclass)
+      return declare_scoreboard(node, name) if superclass == "Cuprite::Scoreboard"
+
       unless superclass && @program.exceptions.known?(superclass)
         error("only exception classes (subclasses of StandardError and friends) can be defined", node)
       end
@@ -192,6 +194,138 @@ module Cuprite
       error("exception classes cannot have a body", node) if node.body
 
       @program.exceptions.define(name, superclass)
+    end
+
+    # --- Minecraft interop (design §9) -------------------------------------
+
+    OBJECTIVE_NAME = /\A[A-Za-z0-9_.+-]+\z/
+
+    def declare_scoreboard(node, name)
+      error("scoreboard class #{name} is already defined", node) if @program.scoreboards.key?(name)
+
+      objectives = {}
+      (node.body&.body || []).each do |stmt|
+        unless stmt.is_a?(Prism::CallNode) && stmt.name == :objective && stmt.receiver.nil?
+          error("a Cuprite::Scoreboard body may only contain objective declarations", stmt)
+        end
+
+        args = stmt.arguments&.arguments || []
+        sym = args.first
+        error("objective needs a symbol name", stmt) unless sym.is_a?(Prism::SymbolNode)
+
+        method = sym.unescaped
+        opts = args[1] ? keyword_args(args[1], %w[criteria name]) : {}
+        error("objective takes a name and options", stmt) if args.size > 2
+        objective = opts.fetch("name", method)
+        error("invalid objective name #{objective.inspect}", stmt) unless objective.match?(OBJECTIVE_NAME)
+        error("objective #{method} is declared twice", stmt) if objectives.key?(method)
+
+        objectives[method] = IR::Objective.new(objective, opts.fetch("criteria", "dummy"))
+      end
+      @program.scoreboards[name] = objectives
+    end
+
+    # Literal keyword arguments: { "key" => String }.
+    def keyword_args(node, allowed)
+      error("expected keyword arguments", node) unless node.is_a?(Prism::KeywordHashNode)
+
+      node.elements.to_h do |assoc|
+        error("expected keyword arguments", assoc) unless assoc.is_a?(Prism::AssocNode) && assoc.key.is_a?(Prism::SymbolNode)
+        key = assoc.key.unescaped
+        error("unknown keyword #{key}", assoc) unless allowed.include?(key)
+        value = assoc.value
+        unless value.is_a?(Prism::SymbolNode) || value.is_a?(Prism::StringNode)
+          error("#{key}: needs a string or symbol literal", value)
+        end
+
+        [key, value.unescaped]
+      end
+    end
+
+    # Cuprite.command "..." (design §9.2)
+    def compile_command(node, args, used:)
+      error("Cuprite.command takes one string", node) unless args.size == 1 && !node.block
+
+      arg = args.first
+      parts =
+        case arg
+        when Prism::StringNode then [arg.unescaped]
+        when Prism::InterpolatedStringNode
+          arg.parts.map do |part|
+            case part
+            when Prism::StringNode then part.unescaped
+            # Capture each value now so a later interpolation that assigns
+            # the same variable cannot change it.
+            when Prism::EmbeddedStatementsNode then stable(compile_body(part.statements))
+            else error("unsupported string interpolation", part)
+            end
+          end
+        else error("Cuprite.command needs a string literal", arg)
+        end
+      first = parts.first
+      parts[0] = first.delete_prefix("/") if first.is_a?(String)
+      dst = used ? @fn.temp : nil
+      emit IR::Command.new(dst: dst, parts: parts)
+      dst || IR::Const.nil
+    end
+
+    SCORE_OPS = %w[get set add remove reset].freeze
+
+    # Scores.kills.get(target: "@p") and friends (design §9.1).
+    def compile_score_call(node, name, recv, args)
+      return nil unless recv.is_a?(Prism::CallNode) && recv.receiver && recv.arguments.nil? && !recv.block
+      return nil unless recv.receiver.is_a?(Prism::ConstantReadNode) || recv.receiver.is_a?(Prism::ConstantPathNode)
+
+      board = @program.scoreboards[constant_name(recv.receiver)] or return nil
+      objective = board[recv.name.to_s] or error("#{constant_name(recv.receiver)} has no objective #{recv.name}", recv)
+      op = name.to_s
+      error("unknown scoreboard operation #{op} (use #{SCORE_OPS.join(', ')})", node) unless SCORE_OPS.include?(op)
+
+      kwargs = args.last.is_a?(Prism::KeywordHashNode) ? args.pop : nil
+      opts = kwargs ? keyword_args(kwargs, %w[target]) : {}
+      target = opts["target"]
+      error("#{op} needs target: \"<selector or name>\"", node) unless target.is_a?(String)
+      error("invalid score holder #{target.inspect}", node) if target.empty? || target.match?(/\s(?![^\[]*\])/)
+
+      takes_value = %w[set add remove].include?(op)
+      error("#{op} takes #{takes_value ? 'a value and ' : ''}target:", node) unless args.size == (takes_value ? 1 : 0)
+
+      value = takes_value ? compile_expr(args.first) : nil
+      dst = op == "get" ? @fn.temp : nil
+      emit IR::Score.new(op: op.to_sym, dst: dst, objective: objective.name, target: target, value: value)
+      dst || IR::Const.nil
+    end
+
+    CONTEXT_BLOCKS = { as: "as", at: "at", positioned: "positioned", rotated: "rotated", execute: nil }.freeze
+
+    # as("@a") { ... }, at, positioned, rotated, execute("...") (design §9.3)
+    def compile_context_block(node, name, args)
+      block = node.block
+      error("#{name} needs a block", node) unless block.is_a?(Prism::BlockNode)
+      error("#{name} takes one string argument", node) unless args.size == 1
+      if args.first.is_a?(Prism::KeywordHashNode) || args.size > 1
+        error("#{name}: unsupported arguments", node)
+      end
+      arg = args.first
+      error("#{name} needs a string literal argument", arg) unless arg.is_a?(Prism::StringNode)
+
+      text = arg.unescaped.strip
+      error("#{name} needs a non-empty argument", arg) if text.empty?
+      subcommands = CONTEXT_BLOCKS[name] ? "#{CONTEXT_BLOCKS[name]} #{text}" : text.delete_prefix("execute ")
+      error("#{name}: use the block instead of 'run'", arg) if subcommands.match?(/(?:\A| )run(?: |\z)/)
+      error("block parameters are not supported for #{name}", block) if block.parameters
+
+      body = with_block_scope(block) do
+        @loops << :context
+        before = @assigned.dup
+        # Locals first assigned in the block start unset for each entity.
+        b = into([]) { block_body { compile_body(block.body, used: false) } }
+        @assigned = before
+        @loops.pop
+        b
+      end
+      emit IR::Exec.new(subcommands: subcommands, body: body, pending: @fn.temp, pending_exc: @fn.temp)
+      IR::Const.nil
     end
 
     # "Foo" or "Cuprite::Foo" for a constant reference node.
@@ -303,6 +437,7 @@ module Cuprite
     end
 
     def compile_return(node)
+      error("return inside a context block (as, at, ...) is not supported", node) if @loops.include?(:context)
       args = node.arguments&.arguments || []
       error("returning several values is not supported", node) if args.size > 1
       value = args.empty? ? IR::Const.nil : compile_expr(args.first)
@@ -853,11 +988,16 @@ module Cuprite
 
     def compile_break(node)
       error("break outside of a loop", node) if @loops.empty?
+      error("break inside a context block (as, at, ...) is not supported; use next", node) if @loops.last == :context
       args = node.arguments&.arguments || []
       error("break with several values is not supported", node) if args.size > 1
       dst = @loops.last
-      v = args.size == 1 ? compile_expr(args.first) : IR::Const.nil
-      emit IR::Move.new(dst: dst, src: v) if dst
+      # Evaluate the argument even when the loop's value is unused: it can
+      # have side effects (e.g. `break Cuprite.command("...")`). A bare break
+      # makes the loop's value nil.
+      store = dst.is_a?(IR::Local)
+      v = args.size == 1 ? compile_expr(args.first, used: store) : IR::Const.nil
+      emit IR::Move.new(dst: dst, src: v) if store
       emit IR::Break.new
       IR::Const.nil
     end
@@ -921,12 +1061,19 @@ module Cuprite
       if recv && node.block && (result = compile_iterator(node, name, recv, args, used: used))
         return result
       end
+      if recv.is_a?(Prism::ConstantReadNode) && recv.name == :Cuprite && name == :command
+        return compile_command(node, args, used: used)
+      end
+      if recv && (result = compile_score_call(node, name, recv, args.dup))
+        return result
+      end
 
       if recv.nil? || recv.is_a?(Prism::SelfNode)
         case name
         when :puts then return compile_print(node, args, :puts)
         when :p then return compile_print(node, args, :p, used: used)
         when :raise then return compile_raise(node, args)
+        when *CONTEXT_BLOCKS.keys then return compile_context_block(node, name, args)
         when :loop
           error("loop needs a block", node) unless node.block.is_a?(Prism::BlockNode) && args.empty?
           return compile_loop_block(node.block, used: used)

@@ -36,6 +36,8 @@ module Cuprite
       @test_mode = test_mode
       @constants = Set.new
       @block_count = 0
+      @exec_slots = 0
+      @live_storage = []
     end
 
     def generate
@@ -205,8 +207,15 @@ module Cuprite
       when IR::Call then may_raise?(ins.fn)
       when IR::Arith then arith_checks?(ins)
       when IR::Compare then compare_checks?(ins)
+      when IR::Score then ins.value && @types.nilable?(ins.value)
       else false
       end
+    end
+
+    def exec_raises?(ins)
+      found = false
+      IR.each_instr(ins.body) { |i| found ||= raises_directly?(i) }
+      found
     end
 
     def arith_checks?(ins)
@@ -399,6 +408,7 @@ module Cuprite
       when IR::Return, IR::Break, IR::Next, IR::Raise, IR::Try then true
       when IR::If then may_unwind?(ins.then_body) || may_unwind?(ins.else_body)
       when IR::Loop then escapes_loop?(ins.body)
+      when IR::Exec then exec_raises?(ins)
       else raises_directly?(ins)
       end
     end
@@ -442,6 +452,9 @@ module Cuprite
       when IR::Call then call(ins, out)
       when IR::Loop then compile_loop(ins, out)
       when IR::Raise then out << raise_command(ins.klass, ins.message)
+      when IR::Command then command(ins, out)
+      when IR::Score then score(ins, out)
+      when IR::Exec then compile_exec(ins, out)
       when IR::Try then compile_try(ins, out)
       when IR::Break then out << "return run function #{helper(:break)}"
       when IR::Next then out << "return run function #{helper(:next)}"
@@ -486,6 +499,145 @@ module Cuprite
     def compile_return(ins, out)
       move(:ret, ins.src, out) unless @fn.entry_point?
       out << unwind
+    end
+
+    # --- Minecraft interop -------------------------------------------------
+
+    # Cuprite.command. Literal commands are emitted as they are; interpolated
+    # integers go through a function macro (design §9.2).
+    def command(ins, out)
+      dynamic = ins.parts.reject { |p| p.is_a?(String) }
+      dynamic.each do |v|
+        error("only Integers can be interpolated into commands") unless types_of(v) == Set[:int]
+      end
+      if dynamic.empty? || dynamic.all? { |v| v.is_a?(IR::Const) }
+        line = ins.parts.map { |p| p.is_a?(String) ? p : p.value.to_s }.join
+        error("Cuprite.command needs a single-line command") if line.include?("\n")
+        out << (ins.dst ? "execute store result score #{ref(ins.dst)} run #{line}" : line)
+        return
+      end
+
+      template = +""
+      args = []
+      ins.parts.each do |p|
+        if p.is_a?(String)
+          error("Cuprite.command needs a single-line command") if p.include?("\n")
+          # The command becomes a macro line, where literal "$(" would be
+          # read as a parameter.
+          error("Cuprite.command cannot contain literal \"$(\" when it interpolates values") if p.include?("$(")
+          template << p
+        elsif p.is_a?(IR::Const)
+          template << p.value.to_s
+        else
+          key = "a#{args.size}"
+          args << [key, p]
+          template << "$(#{key})"
+        end
+      end
+      @macros ||= {}
+      path = @macros[template] ||= begin
+        mpath = "__cmd/#{@macros.size + 1}"
+        @pack.add_function(mpath, ["$return run #{template}"])
+        mpath
+      end
+      args.each do |key, v|
+        out << "execute store result storage #{names.storage} args.#{key} int 1 run scoreboard players get #{ref(v)}"
+      end
+      call = "function #{names.function(path)} with storage #{names.storage} args"
+      out << (ins.dst ? "execute store result score #{ref(ins.dst)} run #{call}" : call)
+    end
+
+    def score(ins, out)
+      target = "#{ins.target} #{ins.objective}"
+      case ins.op
+      when :get
+        out << "scoreboard players reset #{ref(ins.dst)}"
+        out << "execute if score #{target} matches #{ANY} run scoreboard players operation #{ref(ins.dst)} = #{target}"
+      when :reset
+        out << "scoreboard players reset #{target}"
+      else
+        v = ins.value
+        error("scoreboard #{ins.op} needs an Integer") if types_of(v).include?(:bool)
+        check_not_nil(v, ins.op, out)
+        # A value known to be nil always raises (above); there is no
+        # operation to emit after that.
+        return if (v.is_a?(IR::Const) && v.value.nil?) || types_of(v) == Set[:nil]
+
+        if v.is_a?(IR::Const)
+          n = v.value
+          case ins.op
+          when :set then out << "scoreboard players set #{target} #{n}"
+          when :add, :remove
+            # Negating INT_MIN wraps back to INT_MIN, which has no add/remove
+            # form: amounts must fit in a signed 32-bit integer.
+            n = wrap(-n) if ins.op == :remove
+            out << if n == INT_MIN
+                     "scoreboard players operation #{target} += #{const_ref(n)}"
+                   elsif n >= 0
+                     "scoreboard players add #{target} #{n}"
+                   else
+                     "scoreboard players remove #{target} #{-n}"
+                   end
+          end
+        else
+          op = { set: "=", add: "+=", remove: "-=" }.fetch(ins.op)
+          out << "scoreboard players operation #{target} #{op} #{ref(v)}"
+        end
+      end
+    end
+
+    # A context block. The body runs once per execution context created by
+    # the subcommands (e.g. once per entity for `as @a`). If the body can
+    # raise, each run goes through a wrapper that keeps the first exception
+    # aside so the other entities still run; it is re-raised afterwards
+    # (design §9.3). `next` ends the current entity's run.
+    def compile_exec(ins, out)
+      prefix = "execute #{ins.subcommands}"
+      raises = exec_raises?(ins)
+      nexts = has_next?(ins.body)
+      unless raises || nexts
+        # Always a function of its own, even for one command or none: a
+        # user command such as `return 1` must end only this entity's run,
+        # and the subcommands (e.g. `summon`) must run even if the body is
+        # empty.
+        out << "#{prefix} run function #{new_block_function(compile_nested(ins.body))}"
+        return
+      end
+
+      # The payload of the exception kept aside lives in storage, which is
+      # not part of a frame; a recursive call made from the body saves and
+      # restores it with the frame's locals (see #save_locals).
+      @exec_slots += 1
+      saved_exc = "#{names.storage} pending_exc.e#{@exec_slots}"
+      @live_storage << saved_exc if raises
+      body_lines = begin
+        compile_nested(ins.body)
+      ensure
+        @live_storage.pop if raises
+      end
+      body_fn = new_block_function(body_lines + ["return 0"])
+      wrapper = ["function #{body_fn}"]
+      if raises
+        record = new_block_function([
+          "scoreboard players set #{ref(ins.pending)} 1",
+          "scoreboard players operation #{ref(ins.pending_exc)} = #{rt(:exc)}",
+          "data modify storage #{saved_exc} set from storage #{names.storage} exc"
+        ])
+        wrapper << "execute if score #{rt(:ctl)} matches 4 unless score #{ref(ins.pending)} matches 1 run function #{record}"
+      end
+      wrapper << "scoreboard players set #{rt(:ctl)} 0"
+      wrapper_fn = new_block_function(wrapper)
+      out << "scoreboard players set #{ref(ins.pending)} 0" if raises
+      out << "#{prefix} run function #{wrapper_fn}"
+      return unless raises
+
+      reraise = new_block_function([
+        "scoreboard players operation #{rt(:exc)} = #{ref(ins.pending_exc)}",
+        "data modify storage #{names.storage} exc set from storage #{saved_exc}",
+        "scoreboard players set #{rt(:ctl)} 4",
+        "return 1"
+      ])
+      out << "execute if score #{ref(ins.pending)} matches 1 run return run function #{reraise}"
     end
 
     # --- Loops -------------------------------------------------------------
@@ -557,6 +709,9 @@ module Cuprite
         out << "execute if score #{ref(v)} matches #{ANY} store result storage #{stack}[-1].v#{i} int 1 " \
                "run scoreboard players get #{ref(v)}"
       end
+      @live_storage.each_with_index do |path, i|
+        out << "execute if data storage #{path} run data modify storage #{stack}[-1].s#{i} set from storage #{path}"
+      end
       ensure_slots.each_with_index do |slot, i|
         out << "execute if data storage #{slot} run data modify storage #{stack}[-1].e#{i} set from storage #{slot}"
       end
@@ -569,6 +724,9 @@ module Cuprite
         out << "scoreboard players reset #{ref(v)}" if @types.nilable?(v)
         out << "execute if data storage #{stack}[-1].v#{i} store result score #{ref(v)} " \
                "run data get storage #{stack}[-1].v#{i}"
+      end
+      @live_storage.each_with_index do |path, i|
+        out << "execute if data storage #{stack}[-1].s#{i} run data modify storage #{path} set from storage #{stack}[-1].s#{i}"
       end
       ensure_slots.each_with_index do |slot, i|
         out << "data remove storage #{slot}"

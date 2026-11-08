@@ -21,6 +21,17 @@ cuprite build            # writes build/demo/ (and copies it into <world>/datapa
 
 In game, run the top-level program with `/function demo:main`.
 
+## Status
+
+Implemented: integers / booleans / nil, locals and globals, arithmetic with
+32-bit wrapping, conditionals, `case`, loops, methods and recursion,
+`puts` / `p`, exceptions, `Cuprite.command`, `Cuprite::Scoreboard`, and
+context blocks (`as`, `at`, `positioned`, `rotated`, `execute`).
+
+Not yet implemented: suspension and tasks (`wait`, `sleep`, `next_tick`,
+`wait_until`, waiting context blocks, `as(..., wait: false)`; design
+§6.2–§6.6 and the waiting parts of §9.3).
+
 ## Development
 
 ```sh

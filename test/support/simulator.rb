@@ -63,6 +63,11 @@ module Cuprite
           @tags["#{m[1]}:#{m[2]}"] = JSON.parse(content)["values"]
         end
       end
+      # Objectives the compiler owns (design §5): those Names gives each
+      # namespace of the pack. A user objective may end in ".vars" too.
+      @compiler_objectives = pack.files.keys.filter_map { |path| path[%r{\Adata/([^/]+)/}, 1] }.uniq
+                                 .reject { |ns| ns == "minecraft" }
+                                 .flat_map { |ns| ["#{ns}.vars", "#{ns}.rt", "#{ns}.globals"] }.to_set
       @objectives = {}
       @scores = Hash.new { |h, k| h[k] = {} } # objective => { holder => value }
       @storage = Hash.new { |h, k| h[k] = {} }
@@ -225,16 +230,35 @@ module Cuprite
         @chat << r.rest
         [true, 1]
       when "say", "give", "summon", "particle", "playsound", "effect", "tp", "kill", "setblock", "title", "tag"
-        @log << "#{cmd} #{r.rest}"
+        @log << "#{cmd} #{r.rest_peek}"
         side_effect(cmd, r, ctx)
       else
         raise CommandError, "unknown command #{cmd.inspect}"
       end
     end
 
-    def side_effect(cmd, _r, ctx)
-      if cmd == "kill" && ctx.entity
-        kill(ctx.entity)
+    def side_effect(cmd, r, ctx)
+      case cmd
+      when "kill"
+        targets = r.eof? ? [ctx.entity].compact : select(r.word, ctx)
+        targets.each { |e| kill(e) }
+        return [!targets.empty?, targets.size]
+      when "tag"
+        targets = select(r.word, ctx)
+        op = r.word
+        name = r.word
+        # The result counts the entities whose tags actually changed.
+        changed = targets.count do |e|
+          if op == "add"
+            next false if e.tags.include?(name)
+
+            e.tags << name
+          else
+            !e.tags.delete(name).nil?
+          end
+        end
+
+        return [changed.positive?, changed]
       end
       [true, 1]
     end
@@ -273,6 +297,7 @@ module Cuprite
         obj = objective(r.word)
         n = r.int
         raise CommandError, "#{op} amount out of range" if op != "set" && n.negative?
+        raise CommandError, "#{op} amount #{n} is not a 32-bit integer" unless n.between?(INT_MIN, INT_MAX)
 
         # The result is the sum of the resulting scores.
         total = holders.sum do |h|
@@ -314,7 +339,10 @@ module Cuprite
 
             tv = @scores[tobj][t]
             if tv.nil?
-              raise CommandError, "operation #{operation} on unset target #{t}" if strict && operation != "="
+              # The game starts an unset target at 0. Cuprite's own slots never
+              # rely on that, so strict mode flags it as a compiler bug.
+              compiler_slot = @compiler_objectives.include?(tobj)
+              raise CommandError, "operation #{operation} on unset target #{t}" if strict && compiler_slot && operation != "="
 
               tv = 0
             end

@@ -56,6 +56,16 @@ module Cuprite
     Next = instr()
     # Return src from the current function.
     Return = instr(:src)
+    # Cuprite.command: parts are Strings and Integer operands to interpolate.
+    # dst (may be nil) receives the command's result.
+    Command = instr(:dst, :parts)
+    # Declared scoreboard access (design §9.1). op: :get (into dst), :set,
+    # :add, :remove, :reset. target is a selector or score holder name.
+    Score = instr(:op, :dst, :objective, :target, :value)
+    # A context block (design §9.3): runs body under `execute <subcommands>`.
+    # pending / pending_exc are scratch locals for exceptions raised by one
+    # of the forked executions.
+    Exec = instr(:subcommands, :body, :pending, :pending_exc)
     # raise klass, message
     Raise = instr(:klass, :message)
     # begin body rescue ... else ... ensure ... end. rescues is an Array of
@@ -101,14 +111,21 @@ module Cuprite
       def entry_point? = kind != :method
     end
 
+    # A declared objective: Scores.kills → Objective("kills", "dummy").
+    Objective = Data.define(:name, :criteria)
+
     class Program
-      attr_reader :functions, :globals, :exceptions
+      attr_reader :functions, :globals, :exceptions, :scoreboards
 
       def initialize
         @functions = {}
         @globals = Set.new
         @exceptions = ExceptionTable.new
+        # class name => { method name => Objective }
+        @scoreboards = {}
       end
+
+      def objectives = @scoreboards.values.flat_map(&:values).uniq
 
       def add_function(fn)
         @functions[fn.name] = fn
@@ -128,7 +145,7 @@ module Cuprite
     def self.nested_blocks(ins)
       case ins
       when If then [ins.then_body, ins.else_body]
-      when Loop then [ins.body]
+      when Loop, Exec then [ins.body]
       when Try then [ins.body, *ins.rescues.map(&:body), ins.else_body, ins.ensure_body]
       else []
       end

@@ -44,6 +44,9 @@ module Cuprite
         "scoreboard players set $ctl #{rt} 0",
         "scoreboard players set $exc #{rt} 0"
       ]
+      @program.objectives.each do |o|
+        lines << "scoreboard objectives add #{o.name} #{o.criteria}"
+      end
       @codegen.constants.sort.each do |c|
         lines << "scoreboard players set #{names.const(c)} #{rt} #{c}"
       end
