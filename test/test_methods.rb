@@ -197,4 +197,83 @@ class TestMethods < Minitest::Test
       puts "c"
     RUBY
   end
+
+  # Review fixes (PR #4).
+
+  def test_arguments_are_snapshotted_as_they_are_evaluated
+    assert_same_output(<<~RUBY)
+      def first(a, b) = a
+      def pair(a, b, c) = a * 100 + b * 10 + c
+      x = 1
+      p first(x, x = 2)
+      $g = 1
+      p first($g, $g = 5)
+      y = 1
+      p pair(y, y += 1, y += 1)
+    RUBY
+  end
+
+  def test_unreachable_code_after_return_does_not_affect_return_type
+    assert_same_output(<<~RUBY)
+      def f
+        return 1
+        true
+      end
+      def g(x)
+        if x > 0
+          return 1
+        else
+          return 2
+        end
+        false
+      end
+      def h(x)
+        case x
+        when 0 then return 10
+        else return 20
+        end
+        true
+      end
+      p f, g(1), g(-1), h(0), h(3)
+    RUBY
+  end
+
+  def test_branch_that_returns_does_not_block_definite_assignment
+    assert_same_output(<<~RUBY)
+      def f(x)
+        if x < 0
+          return 0
+        else
+          y = x * 2
+        end
+        y + 1
+      end
+      def g(x) = (x > 0 ? (return 7) : 3)
+      p f(-1), f(4), g(1), g(0)
+    RUBY
+  end
+
+  def test_default_with_side_effects_is_rejected
+    assert_compile_error(/default value of x must be a literal/, <<~RUBY)
+      def f(x = puts("hi")) = x
+      p f
+    RUBY
+  end
+
+  def test_setter_assignment_evaluates_to_the_assigned_value
+    assert_same_output(<<~RUBY)
+      def value=(v)
+        puts "set \#{v}"
+        0
+      end
+      p(self.value = 7)
+      x = 3
+      p(self.value = x)
+    RUBY
+  end
+
+  def test_empty_and_comment_only_programs
+    assert_equal [], run_mc("")
+    assert_equal [], run_mc("# nothing here\n")
+  end
 end

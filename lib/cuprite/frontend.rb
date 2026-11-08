@@ -34,7 +34,9 @@ module Cuprite
         with_function(fn) do
           @line = node.location.start_line
           value = compile_method_body(node.body)
-          emit IR::Return.new(src: value)
+          # A body that always returns has no implicit return; emitting one
+          # would feed an unreachable value into return-type inference.
+          emit IR::Return.new(src: value) unless @terminated
         end
       end
       @program
@@ -45,13 +47,14 @@ module Cuprite
     # --- Context -----------------------------------------------------------
 
     def with_function(fn)
-      saved = [@fn, @block, @assigned]
+      saved = [@fn, @block, @assigned, @terminated]
       @fn = fn
       @block = fn.body
       @assigned = Set.new(fn.params)
+      @terminated = false
       yield
     ensure
-      @fn, @block, @assigned = saved
+      @fn, @block, @assigned, @terminated = saved
     end
 
     # Emits into `block` while the given block runs.
@@ -75,15 +78,29 @@ module Cuprite
       raise CompileError.new(message, file: @file, line: line)
     end
 
-    # Compiles a branch into a new block, tracking definite assignment.
-    # Returns [block, locals assigned in it].
+    # Compiles a branch into a new block, tracking definite assignment and
+    # whether the branch always returns. Returns [block, locals assigned in
+    # it, terminated]. A branch that always returns is treated as having
+    # assigned everything, since code after it only runs via the other path.
     def branch
       before = @assigned
+      outer_terminated = @terminated
       @assigned = before.dup
+      @terminated = false
       block = into([]) { yield }
       assigned = @assigned
+      terminated = @terminated
       @assigned = before
-      [block, assigned]
+      @terminated = outer_terminated
+      [block, assigned, terminated]
+    end
+
+    # Locals definitely assigned after two alternative branches.
+    def merge_assigned(a, a_term, b, b_term)
+      return b if a_term
+      return a if b_term
+
+      a & b
     end
 
     # Prism renamed `consequent` to `subsequent`; support both.
@@ -129,8 +146,13 @@ module Cuprite
       end
       defaults = Array.new(names.size)
       ps.optionals.each do |o|
-        default = with_function(IR::Function.new("(default)", kind: :method)) { compile_expr(o.value) }
-        error("#{name}: default value of #{o.name} must be a literal", o) unless default.is_a?(IR::Const)
+        scratch = IR::Function.new("(default)", kind: :method)
+        default = with_function(scratch) { compile_expr(o.value) }
+        # Defaults are filled in by the caller as constants, so anything that
+        # emits code (e.g. puts) would silently lose its side effects.
+        unless default.is_a?(IR::Const) && scratch.body.empty?
+          error("#{name}: default value of #{o.name} must be a literal", o)
+        end
 
         names << o.name.to_s
         defaults << default
@@ -158,6 +180,7 @@ module Cuprite
       value = args.empty? ? IR::Const.nil : compile_expr(args.first)
       value = IR::Const.nil if @fn.entry_point?
       emit IR::Return.new(src: value)
+      @terminated = true
       IR::Const.nil
     end
 
@@ -175,14 +198,24 @@ module Cuprite
         error("splat and keyword arguments are not supported", a) unless a.is_a?(Prism::Node) && !a.is_a?(Prism::SplatNode) && !a.is_a?(Prism::KeywordHashNode)
 
         v = compile_expr(a)
-        # A self-call assigns this frame's own parameters, so later arguments
-        # must not read a parameter that an earlier one has overwritten.
-        fn.name == @fn.name ? stable(v) : v
+        # Snapshot each argument as it is evaluated: a later argument may
+        # change a variable an earlier one read (f(x, x = 2)). A self-call
+        # also assigns this frame's own parameters one by one, so there even
+        # the last argument must not be a parameter slot.
+        last = a.equal?(args.last) && fn.name != @fn.name
+        last ? v : stable(v)
       end
       ops += fn.defaults[args.size..]
       dst = @fn.temp
       emit IR::Call.new(dst: dst, fn: fn.name, args: ops)
+      # Assignment syntax (self.x = v) evaluates to v, not the setter's result.
+      return ops.last if setter_assignment?(node)
+
       dst
+    end
+
+    def setter_assignment?(node)
+      node.name.to_s.end_with?("=") && node.respond_to?(:attribute_write?) && node.attribute_write?
     end
 
     # --- Statements and expressions ---------------------------------------
@@ -195,7 +228,11 @@ module Cuprite
       stmts = node.is_a?(Prism::StatementsNode) ? node.body : [node]
       return IR::Const.nil if stmts.empty?
 
-      stmts[0..-2].each { |stmt| compile_expr(stmt, used: false) }
+      stmts[0..-2].each do |stmt|
+        compile_expr(stmt, used: false)
+        # Statements after an unconditional return never run.
+        return IR::Const.nil if @terminated
+      end
       compile_expr(stmts.last, used: used)
     end
 
@@ -338,16 +375,17 @@ module Cuprite
     def compile_if(predicate, then_node, else_node, used:, negate: false)
       cond = compile_expr(predicate)
       dst = used ? @fn.temp : nil
-      then_body, then_assigned = branch do
+      then_body, then_assigned, then_term = branch do
         v = compile_expr_or_nil(then_node, used: used)
-        emit IR::Move.new(dst: dst, src: v) if dst
+        emit IR::Move.new(dst: dst, src: v) if dst && !@terminated
       end
-      else_body, else_assigned = branch do
+      else_body, else_assigned, else_term = branch do
         v = compile_expr_or_nil(else_node, used: used)
-        emit IR::Move.new(dst: dst, src: v) if dst
+        emit IR::Move.new(dst: dst, src: v) if dst && !@terminated
       end
       then_body, else_body = else_body, then_body if negate
-      @assigned.merge(then_assigned & else_assigned)
+      @assigned.merge(merge_assigned(then_assigned, then_term, else_assigned, else_term))
+      @terminated ||= then_term && else_term
       # Both branches are tested against cond, so the first must not change it.
       cond = stable(cond) unless then_body.empty? || else_body.empty?
       emit IR::If.new(cond: cond, then_body: then_body, else_body: else_body)
@@ -366,19 +404,20 @@ module Cuprite
       build_when = lambda do |index|
         if index == whens.size
           v = else_node ? compile_body(else_node.statements, used: used) : IR::Const.nil
-          emit IR::Move.new(dst: dst, src: v) if dst
+          emit IR::Move.new(dst: dst, src: v) if dst && !@terminated
           next
         end
         w = whens[index]
         error("pattern matching (case/in) is not supported", w) unless w.is_a?(Prism::WhenNode)
 
         cond = when_condition(subject, w.conditions)
-        then_body, then_assigned = branch do
+        then_body, then_assigned, then_term = branch do
           v = compile_body(w.statements, used: used)
-          emit IR::Move.new(dst: dst, src: v) if dst
+          emit IR::Move.new(dst: dst, src: v) if dst && !@terminated
         end
-        else_body, else_assigned = branch { build_when.call(index + 1) }
-        @assigned.merge(then_assigned & else_assigned)
+        else_body, else_assigned, else_term = branch { build_when.call(index + 1) }
+        @assigned.merge(merge_assigned(then_assigned, then_term, else_assigned, else_term))
+        @terminated ||= then_term && else_term
         emit IR::If.new(cond: cond, then_body: then_body, else_body: else_body)
       end
       build_when.call(0)
