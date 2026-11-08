@@ -78,7 +78,9 @@ module Cuprite
       when IR::Move then add(ins.dst, of(ins.src))
       when IR::Arith then add(ins.dst, [:int])
       when IR::Compare, IR::InRange, IR::Not then add(ins.dst, [:bool])
-      when IR::Try then [ins.flag, ins.flag2, ins.saved_ctl, ins.saved_exc].each { |v| add(v, [:int]) }
+      when IR::Try
+        [ins.flag, ins.flag2, ins.saved_ctl, ins.saved_exc].each { |v| add(v, [:int]) }
+        add(ins.saved_ret, %i[int nil])
       when IR::Return then add_return(fn.name, fn.entry_point? ? [:nil] : of(ins.src))
       when IR::Call
         callee = @program.functions.fetch(ins.fn)

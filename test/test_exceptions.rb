@@ -262,6 +262,81 @@ class TestExceptions < Minitest::Test
     assert_nil sim.storage["t:__runtime"]["last_error"]
   end
 
+  def test_ensure_keeps_pending_return_value
+    assert_same_output(<<~RUBY)
+      def h = 99
+      def f
+        begin
+          return 1
+        ensure
+          h
+        end
+      end
+      def g
+        begin
+          return 1
+        ensure
+          return 2
+        end
+      end
+      p f, g
+    RUBY
+  end
+
+  def test_ensure_keeps_pending_exception_details
+    sim = boot(<<~RUBY)
+      begin
+        raise ArgumentError, "original"
+      ensure
+        begin
+          raise "cleanup"
+        rescue
+        end
+      end
+    RUBY
+    sim.run_function("t:main")
+    assert_equal({ "class" => "ArgumentError", "message" => "original" }, sim.storage["t:__runtime"]["last_error"])
+  end
+
+  def test_next_inside_begin_in_a_loop
+    assert_same_output(<<~RUBY)
+      def g
+        3.times do |i|
+          begin
+            next if i == 0
+          ensure
+            puts "ensure \#{i}"
+          end
+          return 7 if i == 1
+          puts "after \#{i}"
+        end
+        0
+      end
+      p g
+    RUBY
+  end
+
+  def test_operations_on_literal_nil_raise_at_runtime
+    assert_same_output(<<~RUBY)
+      begin
+        p nil / nil
+      rescue NoMethodError
+        puts "div"
+      end
+      begin
+        p nil < 3
+      rescue NoMethodError
+        puts "lt"
+      end
+      x = nil
+      begin
+        p x % x
+      rescue NoMethodError
+        puts "mod"
+      end
+    RUBY
+  end
+
   def test_errors
     assert_compile_error(/unknown exception class Nope/, "raise Nope")
     assert_compile_error(/rescue => variable/, "begin\nrescue => e\nend")
