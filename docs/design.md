@@ -77,7 +77,7 @@ world: ~/.minecraft/saves/MyWorld   # optional; if set, the pack is also copied 
 ### 4.2 Supported constructs
 
 - Local variables, arithmetic, comparison, logical operators.
-- `if` / `unless` / `case`–`when`, loops (see §6).
+- `if` / `unless` / `case`–`when`, loops and waits (see §6).
 - Top-level `def` with arguments and `return`; recursion (see §6.3).
 - `puts` / `p` (see §8) with string literals and interpolation.
 - Global variables (see §4.4).
@@ -109,6 +109,10 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
 - Each Ruby method `foo` is emitted as `<ns>:foo` (stable, callable from
   command blocks and other packs without arguments).
 - Compiler-internal functions live under `<ns>:__*`.
+- **Reserved names**: defining a method named `main`, any `__*` name, or any
+  Kernel control method (§9.0) is a compile error, so user methods can never
+  collide with generated functions or silently shadow built-in control
+  constructs. `on_load` / `on_tick` may only be defined without parameters.
 
 ## 5. Variables and calls
 
@@ -121,28 +125,32 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
 
 ## 6. Loops, recursion and tasks
 
-### 6.1 Two kinds of iteration
+### 6.1 Loops are immediate; waits are explicit
 
 | Construct | Execution |
 |---|---|
-| `while`, `until`, `loop`, `times`, `upto`, `downto`, `Range#each` | **Tick-split**: one iteration per tick |
-| `fast_times`, `fast_upto`, `fast_downto`, `Range#fast_each` | **Immediate**: all iterations within the current tick |
-| Recursive method calls | **Immediate**: executed within the current tick |
+| `while`, `until`, `loop`, `times`, `upto`, `downto`, `Range#each` | **Immediate**: all iterations within the current tick |
+| Recursive method calls | **Immediate** |
+| `wait(ticks)`, `sleep(seconds)`, `next_tick`, `wait_until { cond }` | **Suspend**: execution continues in a later tick |
 
-- Tick-split loops have **no iteration limit**. An infinite tick-split loop is
-  simply a process that never ends; it does not exhaust the command budget.
-- Tick-split loops are **not unrolled** (unrolling would add per-tick dispatch
-  cost and gain nothing).
-- `fast_*` with a literal count/range is **unrolled** up to an internal
-  threshold; otherwise it is compiled to a self-calling function with a
-  counter.
-- Recursion has **no depth limit**. Exceeding the game's command chain limit
-  is the user's responsibility.
+- This matches Ruby semantics: a loop finishes before the next statement runs.
+  Crossing ticks is always visible in the source as an explicit wait.
+- `wait(n)` waits `n` ticks; `sleep(n)` waits `n` seconds (`20 * n` ticks),
+  like `Kernel#sleep`; `next_tick` is `wait(1)`; `wait_until { cond }`
+  re-evaluates `cond` once per tick and continues when it is truthy.
+- A loop whose body contains a wait is suspendable like any other code
+  (e.g. `19.times { particle; next_tick }` runs one iteration per tick).
+- Loops with a literal count may be unrolled by the optimiser.
+- There are **no iteration or recursion-depth limits**. Exceeding the game's
+  command chain limit truncates execution; that is the user's
+  responsibility, but it is detected (§6.7).
+- In CRuby (differential tests), `wait`, `next_tick` and `wait_until` are
+  provided by a shim; tests compare output, not wall-clock time.
 
 ### 6.2 Suspendable functions
 
-- A function containing a tick-split loop, or calling (transitively) such a
-  function, is **suspendable**.
+- A function containing a wait, or calling (transitively) such a function,
+  is **suspendable**.
 - When suspended, its resume point and live locals are stored as scores:
   - on the **executing entity** (`@s`), in per-function objectives such as
     `cuprite.pc.<fn>` and `cuprite.l.<fn>.<var>`;
@@ -169,13 +177,10 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
 - Entry points always start every tick; there is **no limit** on the number of
   concurrent tasks.
 
-### 6.3 Immediate contexts
+### 6.3 Recursion and waits
 
-> Reaching a tick-split loop from an **immediate context** (a recursive
-> method, or the body of a `fast_*` loop) is a **compile error**.
-
-This is a single uniform rule regardless of whether a particular case could
-technically be supported.
+> Reaching a wait from a **recursive method** is a **compile error**
+> (recursive frames live in a storage stack that is not kept across ticks).
 
 ### 6.4 Re-entry
 
@@ -188,6 +193,9 @@ technically be supported.
 - If the executing entity is removed (e.g. a mob dies), its task silently
   disappears with it. `ensure` is **not** run.
 - A player's tasks pause while the player is offline and resume on rejoin.
+  If the block waiting on such a task (§9.3) has already completed, an
+  exception the task raises after rejoining is treated as uncaught and
+  recorded as the last error.
 
 ### 6.6 Code changes and `/reload`
 
@@ -198,6 +206,15 @@ technically be supported.
   mode and recorded as the last error.
 - A plain `/reload` or world restart with an unchanged build keeps tasks
   running.
+
+### 6.7 Truncation detection
+
+- Each entry point sets a `$running` marker on entry and clears it on normal
+  completion (or suspension). If an entry point or `__init` finds the marker
+  still set, the previous run was truncated by the command chain limit.
+- On detection, runtime state (halt flag, recursion stack, temporaries) is
+  reset and the truncation is recorded as the last error. User state
+  (scores, globals, effects of commands) is not rolled back.
 
 ## 7. Exceptions
 
@@ -225,6 +242,15 @@ technically be supported.
   state is stored in a score and persists across reloads.
 
 ## 9. Minecraft interop
+
+### 9.0 Where the API lives
+
+| `Kernel` (control constructs) | `Cuprite` (Minecraft operations) |
+|---|---|
+| `wait`, `sleep`, `next_tick`, `wait_until` | `Cuprite.command` |
+| `as`, `at`, `positioned`, `rotated`, `execute` | `Cuprite::Scoreboard` |
+
+Kernel names are reserved (§4.5).
 
 ### 9.1 Scoreboards
 
@@ -257,20 +283,20 @@ Cuprite.command "give @p diamond #{n}"
 ### 9.3 Execution context
 
 ```ruby
-Cuprite.as("@a[scores={hoge=20}]") do
-  Cuprite.at("@s") do
+as("@a[scores={hoge=20}]") do
+  at("@s") do
     skill
   end
 end
 
-Cuprite.execute("facing entity @p eyes") do
+execute("facing entity @p eyes") do
   ...
 end
 ```
 
-- Dedicated methods: `Cuprite.as`, `Cuprite.at`, `Cuprite.positioned`,
-  `Cuprite.rotated`. Any other subcommand goes through the generic
-  `Cuprite.execute("<subcommands>") { ... }`. Blocks nest.
+- Dedicated methods: `as`, `at`, `positioned`, `rotated`. Any other
+  subcommand goes through the generic `execute("<subcommands>") { ... }`.
+  Blocks nest.
 - The block is compiled to a separate function invoked via `execute ... run function`.
 - **The block waits** until every entity's task has finished. While waiting,
   the caller recounts, each tick, the entities that still exist and still have
