@@ -401,6 +401,10 @@ module Cuprite
     end
 
     def in_range?(v, range)
+      range.split("..").each do |bound|
+        next if bound.empty?
+        raise CommandError, "range bound #{bound} is not a 32-bit integer" unless Integer(bound).between?(-2**31, 2**31 - 1)
+      end
       if range.include?("..")
         lo, hi = range.split("..", 2)
         (lo.empty? || v >= lo.to_i) && (hi.nil? || hi.empty? || v <= hi.to_i)

@@ -16,15 +16,15 @@ module CupriteTestHelpers
   end
 
   # Loads the pack into a fresh simulator (running #minecraft:load).
-  def boot(source, ns: NS, **opts)
-    sim = Cuprite::Simulator.new(compile(source, ns: ns), **opts)
+  def boot(source, ns: NS, debug: false, **opts)
+    sim = Cuprite::Simulator.new(compile(source, ns: ns, debug: debug), **opts)
     sim.load
     sim
   end
 
   # Output lines mirrored into storage by test mode (design §3).
   def output_lines(sim, ns: NS)
-    (sim.storage["#{ns}:__test"]["out"] || []).map { |parts| parts.map(&:to_s).join }
+    (sim.storage["#{ns}:__test"]["out"] || []).map { |parts| parts.map { |part| (part["s"] || part["i"]).to_s }.join }
   end
 
   # Compiles and runs `source` as /function <ns>:main; returns its output.
