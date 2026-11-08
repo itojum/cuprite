@@ -35,6 +35,19 @@ module Cuprite
 
     # dst = src
     Move = instr(:dst, :src)
+    # dst = a <op> b, op in :+ :- :* :/ :% :** (32-bit wrapping)
+    Arith = instr(:dst, :op, :a, :b)
+    # dst = (a <op> b), op in :== :!= :< :<= :> :>=
+    Compare = instr(:dst, :op, :a, :b)
+    # dst = lo <= src && src <= hi (lo / hi are Integers or nil for open ends)
+    InRange = instr(:dst, :src, :lo, :hi)
+    # dst = !src (Ruby truthiness)
+    Not = instr(:dst, :src)
+    # Runs then_body if cond is truthy, else_body otherwise.
+    If = instr(:cond, :then_body, :else_body)
+    # Prints lines. Each line is an Array of parts: a String, or
+    # [operand, :to_s | :inspect].
+    Print = instr(:lines)
     # Return src from the current function.
     Return = instr(:src)
 

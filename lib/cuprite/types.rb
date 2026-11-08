@@ -57,6 +57,8 @@ module Cuprite
     end
 
     def visit_function(fn)
+      # Unassigned globals read as nil, and globals persist across runs.
+      @program.globals.each { |g| add(g, [:nil]) }
       fn.maybe_unassigned.each { |v| add(v, [:nil]) }
       IR.each_instr(fn.body) { |ins| visit(fn, ins) }
     end
@@ -64,6 +66,8 @@ module Cuprite
     def visit(fn, ins)
       case ins
       when IR::Move then add(ins.dst, of(ins.src))
+      when IR::Arith then add(ins.dst, [:int])
+      when IR::Compare, IR::InRange, IR::Not then add(ins.dst, [:bool])
       when IR::Return then add_return(fn.name, of(ins.src))
       end
     end

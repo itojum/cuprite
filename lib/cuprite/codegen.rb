@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "json"
+
 module Cuprite
   # Lowers IR to .mcfunction commands.
   #
@@ -8,7 +10,16 @@ module Cuprite
   #   in <ns>.globals, registers and constants live in <ns>.rt.
   # - nil is an unset score; booleans are 0/1.
   # - A method's return value is left in "$ret <ns>.rt".
+  # - Nested blocks (if branches, ...) become functions under __b/. A block
+  #   function ends with `return 0`; it returns 1 when control must leave the
+  #   enclosing function too (return, and the cases added by later
+  #   constructs). The caller then runs `execute if function <block> run
+  #   return ...` to keep unwinding.
   class Codegen
+    ANY = "-2147483648.."
+    INT_MIN = -2_147_483_648
+    INT_MAX = 2_147_483_647
+
     attr_reader :names, :constants
 
     def initialize(program, types, names, pack, test_mode: false)
@@ -27,7 +38,6 @@ module Cuprite
 
     # Resource path of the function implementing Ruby method `name` (§4.5).
     def function_path(name)
-      @program.functions.fetch(name) # must exist
       @paths ||= begin
         index = 0
         @program.functions.keys.to_h do |n|
@@ -42,43 +52,125 @@ module Cuprite
     end
 
     # Score reference "<holder> <objective>" for an operand slot.
-    def ref(slot)
+    def ref(slot) = "#{holder(slot)} #{objective(slot)}"
+
+    def holder(slot)
       case slot
-      when IR::Local then "$#{slot.fn}.#{slot.name} #{names.vars}"
-      when IR::Global then "#{slot.name} #{names.globals}"
-      when :ret then "$ret #{names.rt}"
+      when IR::Local then "$#{slot.fn}.#{slot.name}"
+      when IR::Global then slot.name
+      when :ret then "$ret"
+      when :scratch then "$t"
       else raise ArgumentError, "not a slot: #{slot.inspect}"
       end
     end
 
-    def rt(register) = "$#{register} #{names.rt}"
+    def objective(slot)
+      case slot
+      when IR::Local then names.vars
+      when IR::Global then names.globals
+      else names.rt
+      end
+    end
+
+    def const_ref(value)
+      @constants << value
+      "#{names.const(value)} #{names.rt}"
+    end
 
     private
 
     def generate_function(fn)
       @fn = fn
+      @nested = false
+      @print_slots = 0
       lines = []
       fn.maybe_unassigned.each { |v| lines << "scoreboard players reset #{ref(v)}" }
       lines.concat(compile_block(fn.body))
+      lines.pop if lines.last == "return 0" && fn.entry_point?
       @pack.add_function(function_path(fn.name), lines)
     end
 
     def compile_block(block)
       out = []
-      block.each { |ins| compile_instr(ins, out) }
+      block.each do |ins|
+        @line = ins.line
+        compile_instr(ins, out)
+      end
       out
+    end
+
+    # Compiles `block` as the body of a nested block function.
+    def compile_nested(block)
+      saved = @nested
+      @nested = true
+      compile_block(block)
+    ensure
+      @nested = saved
+    end
+
+    # The command that leaves the current function while unwinding.
+    def unwind = @nested ? "return 1" : "return 0"
+
+    def new_block_function(lines)
+      @block_count += 1
+      path = "__b/#{@block_count}"
+      @pack.add_function(path, lines)
+      names.function(path)
+    end
+
+    # Runs `block` under the execute prefix (e.g. "execute if score ...").
+    def call_block(block, out, prefix)
+      lines = compile_nested(block)
+      return if lines.empty?
+
+      unwinds = may_unwind?(block)
+      if lines.size == 1 && !unwinds
+        out << (prefix == "execute" ? lines.first : "#{prefix} run #{lines.first}")
+        return
+      end
+      fn = new_block_function(lines + ["return 0"])
+      out << if unwinds
+               "#{prefix} if function #{fn} run #{unwind}"
+             else
+               (prefix == "execute" ? "function #{fn}" : "#{prefix} run function #{fn}")
+             end
+    end
+
+    # Whether running `block` can make control leave the enclosing function.
+    def may_unwind?(block)
+      block.any? { |ins| instr_unwinds?(ins) }
+    end
+
+    def instr_unwinds?(ins)
+      case ins
+      when IR::Return then true
+      when IR::If then may_unwind?(ins.then_body) || may_unwind?(ins.else_body)
+      else false
+      end
     end
 
     def compile_instr(ins, out)
       case ins
       when IR::Move then move(ins.dst, ins.src, out)
-      when IR::Return
-        move(:ret, ins.src, out)
-        out << "return 0"
+      when IR::Arith then arith(ins, out)
+      when IR::Compare then compare(ins, out)
+      when IR::InRange then in_range(ins, out)
+      when IR::Not then logical_not(ins, out)
+      when IR::If then compile_if(ins, out)
+      when IR::Print then print(ins, out)
+      when IR::Return then compile_return(ins, out)
       else
         raise Error, "codegen: unsupported instruction #{ins.class}"
       end
     end
+
+    def error(message)
+      raise CompileError.new(message, line: @line)
+    end
+
+    def types_of(operand) = @types.of(operand)
+
+    # --- Moves -------------------------------------------------------------
 
     # dst = src, where src may be a constant, a slot, or nil.
     def move(dst, src, out)
@@ -93,14 +185,312 @@ module Cuprite
         return if src == dst
 
         if @types.nilable?(src)
-          out << "scoreboard players reset #{ref(dst)}"
-          out << "execute if score #{ref(src)} matches #{ANY} run scoreboard players operation #{ref(dst)} = #{ref(src)}"
+          out << "scoreboard players reset #{ref(dst)}" unless types_of(src) == Set[:nil]
+          out << if types_of(src) == Set[:nil]
+                   "scoreboard players reset #{ref(dst)}"
+                 else
+                   "execute if score #{ref(src)} matches #{ANY} run scoreboard players operation #{ref(dst)} = #{ref(src)}"
+                 end
         else
           out << "scoreboard players operation #{ref(dst)} = #{ref(src)}"
         end
       end
     end
 
-    ANY = "-2147483648.."
+    def compile_return(ins, out)
+      move(:ret, ins.src, out) unless @fn.entry_point?
+      out << unwind
+    end
+
+    # --- Arithmetic --------------------------------------------------------
+
+    OPERATION = { :+ => "+=", :- => "-=", :* => "*=", :/ => "/=", :% => "%=" }.freeze
+
+    def arith(ins, out)
+      dst, op, a, b = ins.dst, ins.op, ins.a, ins.b
+      [a, b].each do |x|
+        error("#{op} is only defined for Integers here") if types_of(x).include?(:bool)
+      end
+
+      if a.is_a?(IR::Const) && b.is_a?(IR::Const) && (folded = fold(op, a.value, b.value))
+        return move(dst, IR::Const.int(folded), out)
+      end
+
+      if op == :**
+        unless b.is_a?(IR::Const) && b.value.is_a?(Integer) && b.value >= 0
+          error("** needs a non-negative integer literal exponent")
+        end
+        src = a
+        if a == dst
+          move(:scratch, a, out)
+          src = :scratch
+        end
+        out << "scoreboard players set #{ref(dst)} 1"
+        b.value.times { apply_op(dst, :*, src, out) }
+        return
+      end
+
+      if b == dst && a != dst
+        move(:scratch, a, out)
+        apply_op(:scratch, op, b, out)
+        move_raw(dst, :scratch, out)
+      else
+        move(dst, a, out)
+        apply_op(dst, op, b, out)
+      end
+    end
+
+    def move_raw(dst, src, out)
+      out << "scoreboard players operation #{ref(dst)} = #{ref(src)}"
+    end
+
+    # dst op= b
+    def apply_op(dst, op, b, out)
+      if b.is_a?(IR::Const)
+        v = b.value
+        if %i[+ -].include?(op) && v != INT_MIN
+          v = -v if op == :-
+          return if v.zero?
+
+          out << (v.positive? ? "scoreboard players add #{ref(dst)} #{v}" : "scoreboard players remove #{ref(dst)} #{-v}")
+          return
+        end
+        out << "scoreboard players operation #{ref(dst)} #{OPERATION.fetch(op)} #{const_ref(v)}"
+      else
+        out << "scoreboard players operation #{ref(dst)} #{OPERATION.fetch(op)} #{ref(b)}"
+      end
+    end
+
+    def fold(op, a, b)
+      return nil if a.nil? || b.nil?
+
+      v = case op
+          when :+ then a + b
+          when :- then a - b
+          when :* then a * b
+          when :/ then b.zero? ? (return nil) : a.div(b)
+          when :% then b.zero? ? (return nil) : a.modulo(b)
+          when :** then b.negative? || b > 64 ? (return nil) : a.pow(b, 1 << 32)
+          end
+      wrap(v)
+    end
+
+    def wrap(v)
+      v &= 0xffff_ffff
+      v >= 0x8000_0000 ? v - 0x1_0000_0000 : v
+    end
+
+    # --- Comparisons -------------------------------------------------------
+
+    MIRROR = { :< => :>, :<= => :>=, :> => :<, :>= => :<=, :== => :==, :!= => :!= }.freeze
+
+    def set_bool(dst, value, out) = move(dst, IR::Const.bool(value), out)
+
+    def compare(ins, out)
+      dst, op, a, b = ins.dst, ins.op, ins.a, ins.b
+      if a.is_a?(IR::Const) && !b.is_a?(IR::Const)
+        a, b = b, a
+        op = MIRROR.fetch(op)
+      end
+
+      if %i[== !=].include?(op)
+        equality(dst, a, b, out, negate: op == :!=)
+      else
+        [a, b].each do |x|
+          error("comparison with #{op} is only defined for Integers") unless (types_of(x) - [:nil]).subset?(Set[:int])
+        end
+        if b.is_a?(IR::Const)
+          if a.is_a?(IR::Const)
+            return set_bool(dst, a.value.public_send(op, b.value), out)
+          end
+
+          range = const_range(op, b.value)
+          return set_bool(dst, false, out) if range.nil?
+
+          out << "execute store success score #{ref(dst)} if score #{ref(a)} matches #{range}"
+        else
+          out << "execute store success score #{ref(dst)} if score #{ref(a)} #{op} #{ref(b)}"
+        end
+      end
+    end
+
+    def const_range(op, v)
+      case op
+      when :< then v == INT_MIN ? nil : "..#{v - 1}"
+      when :<= then "..#{v}"
+      when :> then v == INT_MAX ? nil : "#{v + 1}.."
+      when :>= then "#{v}.."
+      end
+    end
+
+    def equality(dst, a, b, out, negate:)
+      ta = types_of(a)
+      tb = types_of(b)
+      if a.is_a?(IR::Const) && b.is_a?(IR::Const)
+        return set_bool(dst, (a.type == b.type && a.value == b.value) != negate, out)
+      end
+
+      cond = if b.is_a?(IR::Const) && b.type == :nil
+               "unless score #{ref(a)} matches #{ANY}"
+             elsif ((ta - [:nil]) & (tb - [:nil])).empty?
+               # Only nil == nil can be true.
+               return set_bool(dst, negate, out) unless ta.include?(:nil) && tb.include?(:nil)
+
+               "unless score #{ref(a)} matches #{ANY} unless score #{ref(b)} matches #{ANY}"
+             elsif b.is_a?(IR::Const)
+               "if score #{ref(a)} matches #{b.value}"
+             elsif ta.include?(:nil) && tb.include?(:nil)
+               out << "execute store success score #{ref(dst)} if score #{ref(a)} = #{ref(b)}"
+               out << "execute unless score #{ref(a)} matches #{ANY} unless score #{ref(b)} matches #{ANY} " \
+                      "run scoreboard players set #{ref(dst)} 1"
+               out << "execute store success score #{ref(dst)} if score #{ref(dst)} matches 0" if negate
+               return
+             else
+               "if score #{ref(a)} = #{ref(b)}"
+             end
+      if negate && cond.scan(/(?:\A| )(?:if|unless) /).size == 1
+        cond = cond.start_with?("if ") ? cond.sub(/\Aif /, "unless ") : cond.sub(/\Aunless /, "if ")
+        negate = false
+      end
+      out << "execute store success score #{ref(dst)} #{cond}"
+      out << "execute store success score #{ref(dst)} if score #{ref(dst)} matches 0" if negate
+    end
+
+    def in_range(ins, out)
+      error("range tests are only defined for Integers") unless (types_of(ins.src) - [:nil]).subset?(Set[:int])
+      if ins.src.is_a?(IR::Const)
+        v = ins.src.value
+        return set_bool(ins.dst, !v.nil? && (ins.lo.nil? || v >= ins.lo) && (ins.hi.nil? || v <= ins.hi), out)
+      end
+      return set_bool(ins.dst, false, out) if ins.lo && ins.hi && ins.lo > ins.hi
+
+      range = "#{ins.lo}..#{ins.hi}"
+      range = ANY if range == ".."
+      out << "execute store success score #{ref(ins.dst)} if score #{ref(ins.src)} matches #{range}"
+    end
+
+    # --- Truthiness and branches ------------------------------------------
+
+    # :always, :never, or an execute condition (without if/unless) that holds
+    # when `operand` is truthy.
+    def truth_test(operand)
+      if operand.is_a?(IR::Const)
+        return operand.type == :nil || (operand.type == :bool && operand.value.zero?) ? :never : :always
+      end
+
+      t = types_of(operand)
+      return :never if t == Set[:nil]
+      return :always if t == Set[:int]
+      return "score #{ref(operand)} matches 1" if t.include?(:bool)
+
+      "score #{ref(operand)} matches #{ANY}"
+    end
+
+    def logical_not(ins, out)
+      case (test = truth_test(ins.src))
+      when :always then set_bool(ins.dst, false, out)
+      when :never then set_bool(ins.dst, true, out)
+      else out << "execute store success score #{ref(ins.dst)} unless #{test}"
+      end
+    end
+
+    def compile_if(ins, out)
+      case (test = truth_test(ins.cond))
+      when :always then out.concat(compile_block(ins.then_body))
+      when :never then out.concat(compile_block(ins.else_body))
+      else
+        call_block(ins.then_body, out, "execute if #{test}") unless ins.then_body.empty?
+        call_block(ins.else_body, out, "execute unless #{test}") unless ins.else_body.empty?
+      end
+    end
+
+    # --- Output ------------------------------------------------------------
+
+    def print(ins, out)
+      ins.lines.each { |parts| print_line(parts, out) }
+    end
+
+    # One printed line: tellraw (debug mode only) plus, in test mode, a copy
+    # in storage <ns>:__test out as a list of {s:"..."} / {i:N} parts.
+    def print_line(parts, out)
+      components = []
+      mirror = []
+      parts.each do |part|
+        case part
+        when String then add_text(part, components, mirror)
+        else
+          operand, mode = part
+          print_operand(operand, mode, components, mirror, out)
+        end
+      end
+      text = components.empty? ? %({"text":""}) : %({"text":"","extra":[#{components.join(',')}]})
+      out << "execute if score $debug #{names.rt} matches 1 run tellraw @a #{text}"
+      return unless @test_mode
+
+      out << "data modify storage #{names.test_storage} out append value []"
+      mirror.each do |kind, value|
+        case kind
+        when :s then out << "data modify storage #{names.test_storage} out[-1] append value {s:#{JSON.generate(value)}}"
+        when :score
+          out << "data modify storage #{names.test_storage} out[-1] append value {i:0}"
+          out << "execute store result storage #{names.test_storage} out[-1][-1].i int 1 " \
+                 "run scoreboard players get #{ref(value)}"
+        when :slot
+          out << "data modify storage #{names.test_storage} out[-1] append from storage #{names.storage} #{value}"
+        end
+      end
+    end
+
+    def add_text(str, components, mirror)
+      return if str.empty?
+
+      if mirror.last&.first == :s
+        mirror.last[1] += str
+        components[-1] = JSON.generate("text" => mirror.last[1])
+      else
+        mirror << [:s, str.dup]
+        components << JSON.generate("text" => str)
+      end
+    end
+
+    def print_operand(operand, mode, components, mirror, out)
+      if operand.is_a?(IR::Const)
+        return add_text(const_text(operand, mode), components, mirror)
+      end
+
+      t = types_of(operand)
+      if t == Set[:int]
+        components << JSON.generate("score" => { "name" => holder(operand), "objective" => objective(operand) })
+        mirror << [:score, operand]
+        return
+      end
+      if t == Set[:nil]
+        return add_text(mode == :inspect ? "nil" : "", components, mirror)
+      end
+
+      slot = "print.p#{@print_slots += 1}"
+      store = "data modify storage #{names.storage} #{slot}"
+      out << "#{store} set value {s:#{JSON.generate(mode == :inspect ? 'nil' : '')}}" if t.include?(:nil)
+      if t.include?(:bool)
+        out << "execute if score #{ref(operand)} matches 1 run #{store} set value {s:\"true\"}"
+        out << "execute if score #{ref(operand)} matches 0 run #{store} set value {s:\"false\"}"
+      end
+      if t.include?(:int)
+        out << "execute if score #{ref(operand)} matches #{ANY} run #{store} set value {}"
+        out << "execute if score #{ref(operand)} matches #{ANY} store result storage #{names.storage} #{slot}.i int 1 " \
+               "run scoreboard players get #{ref(operand)}"
+      end
+      components << JSON.generate("nbt" => "#{slot}.s", "storage" => names.storage)
+      components << JSON.generate("nbt" => "#{slot}.i", "storage" => names.storage) if t.include?(:int)
+      mirror << [:slot, slot]
+    end
+
+    def const_text(c, mode)
+      case c.type
+      when :nil then mode == :inspect ? "nil" : ""
+      when :bool then (c.value == 1).to_s
+      else c.value.to_s
+      end
+    end
   end
 end

@@ -374,5 +374,7 @@ end
 - Scoreboard `/=` and `%=` use floor division / floor modulo (matching Ruby).
 - How selectors treat dead players (choice of `@e` vs `@a` for resuming tasks).
 - Current game rule names (possible renames in 26.x).
+- `nbt` text components display string tags without quotes (used to print
+  `true` / `false` / `nil` and nilable integers).
 - Network access to Mojang hosts (`piston-meta.mojang.com`,
   `piston-data.mojang.com`) from the development environment.
