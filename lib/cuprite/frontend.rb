@@ -502,7 +502,7 @@ module Cuprite
 
     def compile_loop_block(block, used:)
       with_block_scope(block) do
-        emit_loop(used: used) { compile_body(block.body, used: false) }
+        emit_loop(used: used) { block_body { compile_body(block.body, used: false) } }
       end
     end
 
@@ -527,6 +527,7 @@ module Cuprite
         range = recv.is_a?(Prism::ParenthesesNode) ? recv.body&.body&.first : recv
         return nil unless range.is_a?(Prism::RangeNode) && args.empty?
 
+        error("the value of Range#each is a Range, which is not supported (end the method or expression with nil if the value is not needed)", node) if used
         from, to, exclusive = range_bounds(range)
         count_loop(block, from, to, step: 1, inclusive: !exclusive, used: false, result: IR::Const.nil)
       end
@@ -548,6 +549,7 @@ module Cuprite
       range = node.collection
       range = range.body&.body&.first if range.is_a?(Prism::ParenthesesNode)
       error("for loops need an Integer range", node) unless range.is_a?(Prism::RangeNode)
+      error("the value of a for loop is a Range, which is not supported (end the method or expression with nil if the value is not needed)", node) if used
 
       from, to, exclusive = range_bounds(range)
       var = local_slot(target.name, target.depth)
@@ -565,18 +567,27 @@ module Cuprite
 
       with_block_scope(block) do
         var = params.empty? ? nil : local_slot(params.first)
-        counted_loop(from, to, step: step, inclusive: inclusive, var: var, used: false) do
-          compile_body(block.body, used: false)
+        # The iterator returns its receiver, or the value of a `break`.
+        counted_loop(from, to, step: step, inclusive: inclusive, var: var, used: used, initial: result) do
+          block_body([var].compact) { compile_body(block.body, used: false) }
         end
       end
-      used ? result : IR::Const.nil
     end
 
-    def counted_loop(from, to, step:, inclusive:, var:, used:)
+    # An inclusive loop stops after the iteration whose counter equals `to`
+    # rather than stepping past it: past INT_MAX / INT_MIN the counter would
+    # wrap around and still satisfy the bound.
+    def counted_loop(from, to, step:, inclusive:, var:, used:, initial: IR::Const.nil)
       counter = @fn.temp
       emit IR::Move.new(dst: counter, src: from)
       emit IR::Arith.new(dst: counter, op: :-, a: counter, b: IR::Const.int(step))
-      emit_loop(used: used) do
+      last = nil
+      if inclusive
+        last = @fn.temp
+        emit IR::Move.new(dst: last, src: IR::Const.bool(false))
+      end
+      emit_loop(used: used, initial: initial) do
+        break_unless(last, negate: true) if last
         emit IR::Arith.new(dst: counter, op: :+, a: counter, b: IR::Const.int(step))
         op = if step.positive?
                inclusive ? :<= : :<
@@ -586,6 +597,7 @@ module Cuprite
         t = @fn.temp
         emit IR::Compare.new(dst: t, op: op, a: counter, b: to)
         break_unless(t)
+        emit IR::Compare.new(dst: last, op: :==, a: counter, b: to) if last
         if var
           emit IR::Move.new(dst: var, src: counter)
           @assigned << var
@@ -624,15 +636,25 @@ module Cuprite
       @scopes.pop
     end
 
+    # Compiles one invocation of a block's body. Locals owned by the block
+    # start each invocation as nil, so those the body may read before
+    # assigning are reset at its start.
+    def block_body(params = [])
+      start = @block.size
+      yield
+      resets = @scopes.last.values.map { |n| IR::Local.new(@fn.name, n) }.select do |slot|
+        @fn.maybe_unassigned.include?(slot) && !params.include?(slot)
+      end
+      resets.reverse_each { |slot| @block.insert(start, IR::Move.new(dst: slot, src: IR::Const.nil, line: @line)) }
+    end
+
     def compile_break(node)
       error("break outside of a loop", node) if @loops.empty?
       args = node.arguments&.arguments || []
       error("break with several values is not supported", node) if args.size > 1
       dst = @loops.last
-      if args.size == 1
-        v = compile_expr(args.first)
-        emit IR::Move.new(dst: dst, src: v) if dst
-      end
+      v = args.size == 1 ? compile_expr(args.first) : IR::Const.nil
+      emit IR::Move.new(dst: dst, src: v) if dst
       emit IR::Break.new
       IR::Const.nil
     end

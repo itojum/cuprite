@@ -43,6 +43,15 @@ class TestSimulator < Minitest::Test
     assert_equal 1, sim.score("x", "o")
   end
 
+  def test_tail_call_to_missing_function_fails_like_a_call
+    sim = sim_with("f" => ["scoreboard players set x o 1", "return run function s:missing", "scoreboard players set x o 2"])
+    sim.strict = false
+    assert_equal 0, sim.run_function("s:f")
+    assert_equal 1, sim.score("x", "o")
+    sim.strict = true
+    assert_raises(Cuprite::Simulator::CommandError) { sim.run_function("s:f") }
+  end
+
   def test_macros
     sim = sim_with("m" => ["$scoreboard players set x o $(v)"])
     sim.command("data modify storage s:a args set value {v: 42}")

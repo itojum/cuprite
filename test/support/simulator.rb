@@ -146,6 +146,13 @@ module Cuprite
         return tail ? 0 : nil
       rescue ReturnSignal => e
         return e.value
+      rescue CommandError
+        # A tail-called function that cannot run (unknown, bad macro
+        # arguments) fails its `return run function` like an ordinary call
+        # would: the caller returns 0 unless the simulator is strict.
+        raise if strict || !tail
+
+        return 0
       rescue TailCall => t
         id = t.id
         macro_args = t.args
