@@ -1,0 +1,34 @@
+# Cuprite
+
+Cuprite is an ahead-of-time compiler from a subset of Ruby to a Minecraft
+Java Edition 26.3 data pack. The design is described in
+[docs/design.md](docs/design.md).
+
+## Usage
+
+```yaml
+# cuprite.yml
+namespace: demo
+entry: src/main.rb
+output: build
+debug: false
+# world: ~/.minecraft/saves/MyWorld
+```
+
+```sh
+cuprite build            # writes build/demo/ (and copies it into <world>/datapacks/)
+```
+
+In game, run the top-level program with `/function demo:main`.
+
+## Development
+
+```sh
+bundle install
+bundle exec rake test
+```
+
+Tests compile Ruby programs, run them under CRuby and in
+`test/support/simulator.rb` (a model of the commands Cuprite emits), and
+compare the output. The simulator stands in for the real-server harness of
+design §3 until the dedicated server can be downloaded in CI.
