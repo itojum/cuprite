@@ -39,7 +39,9 @@ module Cuprite
         with_function(fn) do
           @line = node.location.start_line
           value = compile_method_body(node.body)
-          emit IR::Return.new(src: value)
+          # A body that always returns has no implicit return; emitting one
+          # would feed an unreachable value into return-type inference.
+          emit IR::Return.new(src: value) unless @terminated
         end
       end
       @program
@@ -50,7 +52,7 @@ module Cuprite
     # --- Context -----------------------------------------------------------
 
     def with_function(fn)
-      saved = [@fn, @block, @assigned, @scopes, @loops]
+      saved = [@fn, @block, @assigned, @scopes, @loops, @terminated]
       @fn = fn
       @block = fn.body
       @assigned = Set.new(fn.params)
@@ -59,9 +61,11 @@ module Cuprite
       @scopes = [{}]
       # Result slots of the enclosing loops, innermost last.
       @loops = []
+      # Whether control has unconditionally left the method (return).
+      @terminated = false
       yield
     ensure
-      @fn, @block, @assigned, @scopes, @loops = saved
+      @fn, @block, @assigned, @scopes, @loops, @terminated = saved
     end
 
     # Emits into `block` while the given block runs.
@@ -85,15 +89,29 @@ module Cuprite
       raise CompileError.new(message, file: @file, line: line)
     end
 
-    # Compiles a branch into a new block, tracking definite assignment.
-    # Returns [block, locals assigned in it].
+    # Compiles a branch into a new block, tracking definite assignment and
+    # whether the branch always returns. Returns [block, locals assigned in
+    # it, terminated]. A branch that always returns is treated as having
+    # assigned everything, since code after it only runs via the other path.
     def branch
       before = @assigned
+      outer_terminated = @terminated
       @assigned = before.dup
+      @terminated = false
       block = into([]) { yield }
       assigned = @assigned
+      terminated = @terminated
       @assigned = before
-      [block, assigned]
+      @terminated = outer_terminated
+      [block, assigned, terminated]
+    end
+
+    # Locals definitely assigned after two alternative branches.
+    def merge_assigned(a, a_term, b, b_term)
+      return b if a_term
+      return a if b_term
+
+      a & b
     end
 
     # Prism renamed `consequent` to `subsequent`; support both.
@@ -139,8 +157,13 @@ module Cuprite
       end
       defaults = Array.new(names.size)
       ps.optionals.each do |o|
-        default = with_function(IR::Function.new("(default)", kind: :method)) { compile_expr(o.value) }
-        error("#{name}: default value of #{o.name} must be a literal", o) unless default.is_a?(IR::Const)
+        scratch = IR::Function.new("(default)", kind: :method)
+        default = with_function(scratch) { compile_expr(o.value) }
+        # Defaults are filled in by the caller as constants, so anything that
+        # emits code (e.g. puts) would silently lose its side effects.
+        unless default.is_a?(IR::Const) && scratch.body.empty?
+          error("#{name}: default value of #{o.name} must be a literal", o)
+        end
 
         names << o.name.to_s
         defaults << default
@@ -421,6 +444,7 @@ module Cuprite
       value = args.empty? ? IR::Const.nil : compile_expr(args.first)
       value = IR::Const.nil if @fn.entry_point?
       emit IR::Return.new(src: value)
+      @terminated = true
       IR::Const.nil
     end
 
@@ -438,14 +462,24 @@ module Cuprite
         error("splat and keyword arguments are not supported", a) unless a.is_a?(Prism::Node) && !a.is_a?(Prism::SplatNode) && !a.is_a?(Prism::KeywordHashNode)
 
         v = compile_expr(a)
-        # A self-call assigns this frame's own parameters, so later arguments
-        # must not read a parameter that an earlier one has overwritten.
-        fn.name == @fn.name ? stable(v) : v
+        # Snapshot each argument as it is evaluated: a later argument may
+        # change a variable an earlier one read (f(x, x = 2)). A self-call
+        # also assigns this frame's own parameters one by one, so there even
+        # the last argument must not be a parameter slot.
+        last = a.equal?(args.last) && fn.name != @fn.name
+        last ? v : stable(v)
       end
       ops += fn.defaults[args.size..]
       dst = @fn.temp
       emit IR::Call.new(dst: dst, fn: fn.name, args: ops)
+      # Assignment syntax (self.x = v) evaluates to v, not the setter's result.
+      return ops.last if setter_assignment?(node)
+
       dst
+    end
+
+    def setter_assignment?(node)
+      node.name.to_s.end_with?("=") && node.respond_to?(:attribute_write?) && node.attribute_write?
     end
 
     # --- Statements and expressions ---------------------------------------
@@ -458,7 +492,11 @@ module Cuprite
       stmts = node.is_a?(Prism::StatementsNode) ? node.body : [node]
       return IR::Const.nil if stmts.empty?
 
-      stmts[0..-2].each { |stmt| compile_expr(stmt, used: false) }
+      stmts[0..-2].each do |stmt|
+        compile_expr(stmt, used: false)
+        # Statements after an unconditional return never run.
+        return IR::Const.nil if @terminated
+      end
       compile_expr(stmts.last, used: used)
     end
 
@@ -563,8 +601,10 @@ module Cuprite
     end
 
     def op_assign(slot, current, op, value_node)
-      value = compile_expr(value_node)
       error("unsupported operator #{op}=") unless ARITH_OPS.include?(op)
+
+      current = stable(current) unless pure?(value_node)
+      value = compile_expr(value_node)
 
       emit IR::Arith.new(dst: slot, op: op, a: current, b: value)
       @assigned << slot if slot.is_a?(IR::Local)
@@ -598,6 +638,28 @@ module Cuprite
 
     def temp?(operand) = operand.is_a?(IR::Local) && operand.name.start_with?("%")
 
+    # Whether evaluating `node` cannot change any variable, so operands
+    # compiled before it need no snapshot (see #stable).
+    def pure?(node)
+      case node
+      when nil, Prism::NilNode, Prism::TrueNode, Prism::FalseNode, Prism::IntegerNode,
+           Prism::LocalVariableReadNode, Prism::GlobalVariableReadNode, Prism::StringNode
+        true
+      when Prism::ParenthesesNode then pure?(node.body)
+      when Prism::StatementsNode then node.body.all? { |n| pure?(n) }
+      when Prism::AndNode, Prism::OrNode then pure?(node.left) && pure?(node.right)
+      when Prism::InterpolatedStringNode
+        node.parts.all? { |part| part.is_a?(Prism::StringNode) || pure?(part.statements) }
+      when Prism::CallNode
+        args = node.arguments&.arguments || []
+        operator = (ARITH_OPS + COMPARE_OPS).include?(node.name) && args.size == 1
+        unary = %i[-@ +@ !].include?(node.name) && args.empty?
+        node.receiver && !node.block && (operator || unary) && pure?(node.receiver) && args.all? { |a| pure?(a) }
+      else
+        false
+      end
+    end
+
     # --- Control flow ------------------------------------------------------
 
     # a && b / a || b with Ruby's value semantics and short-circuiting.
@@ -616,16 +678,17 @@ module Cuprite
     def compile_if(predicate, then_node, else_node, used:, negate: false)
       cond = compile_expr(predicate)
       dst = used ? @fn.temp : nil
-      then_body, then_assigned = branch do
+      then_body, then_assigned, then_term = branch do
         v = compile_expr_or_nil(then_node, used: used)
-        emit IR::Move.new(dst: dst, src: v) if dst
+        emit IR::Move.new(dst: dst, src: v) if dst && !@terminated
       end
-      else_body, else_assigned = branch do
+      else_body, else_assigned, else_term = branch do
         v = compile_expr_or_nil(else_node, used: used)
-        emit IR::Move.new(dst: dst, src: v) if dst
+        emit IR::Move.new(dst: dst, src: v) if dst && !@terminated
       end
       then_body, else_body = else_body, then_body if negate
-      @assigned.merge(then_assigned & else_assigned)
+      @assigned.merge(merge_assigned(then_assigned, then_term, else_assigned, else_term))
+      @terminated ||= then_term && else_term
       # Both branches are tested against cond, so the first must not change it.
       cond = stable(cond) unless then_body.empty? || else_body.empty?
       emit IR::If.new(cond: cond, then_body: then_body, else_body: else_body)
@@ -644,19 +707,20 @@ module Cuprite
       build_when = lambda do |index|
         if index == whens.size
           v = else_node ? compile_body(else_node.statements, used: used) : IR::Const.nil
-          emit IR::Move.new(dst: dst, src: v) if dst
+          emit IR::Move.new(dst: dst, src: v) if dst && !@terminated
           next
         end
         w = whens[index]
         error("pattern matching (case/in) is not supported", w) unless w.is_a?(Prism::WhenNode)
 
         cond = when_condition(subject, w.conditions)
-        then_body, then_assigned = branch do
+        then_body, then_assigned, then_term = branch do
           v = compile_body(w.statements, used: used)
-          emit IR::Move.new(dst: dst, src: v) if dst
+          emit IR::Move.new(dst: dst, src: v) if dst && !@terminated
         end
-        else_body, else_assigned = branch { build_when.call(index + 1) }
-        @assigned.merge(then_assigned & else_assigned)
+        else_body, else_assigned, else_term = branch { build_when.call(index + 1) }
+        @assigned.merge(merge_assigned(then_assigned, then_term, else_assigned, else_term))
+        @terminated ||= then_term && else_term
         emit IR::If.new(cond: cond, then_body: then_body, else_body: else_body)
       end
       build_when.call(0)
@@ -711,7 +775,7 @@ module Cuprite
           when :* then x * y
           when :/ then y.zero? ? (return nil) : x.div(y)
           when :% then y.zero? ? (return nil) : x.modulo(y)
-          when :** then y.negative? || y > 64 ? (return nil) : x.pow(y, 1 << 32)
+          when :** then y.negative? ? (return nil) : x.pow(y, 1 << 32)
           end
       v &= 0xffff_ffff
       IR::Const.int(v >= 0x8000_0000 ? v - 0x1_0000_0000 : v)
@@ -733,11 +797,14 @@ module Cuprite
       dst = used ? @fn.temp : nil
       emit IR::Move.new(dst: dst, src: initial) if dst
       before = @assigned.dup
+      outer_terminated = @terminated
       @loops << dst
       body = into([]) { yield }
       @loops.pop
-      # Assignments in a loop body may not happen at all.
+      # A loop body may not run at all: its assignments are not definite and
+      # a return inside it does not end the code after the loop.
       @assigned = before
+      @terminated = outer_terminated
       emit IR::Loop.new(body: body)
       dst || IR::Const.nil
     end
@@ -765,7 +832,7 @@ module Cuprite
 
     def compile_loop_block(block, used:)
       with_block_scope(block) do
-        emit_loop(used: used) { compile_body(block.body, used: false) }
+        emit_loop(used: used) { block_body { compile_body(block.body, used: false) } }
       end
     end
 
@@ -790,6 +857,7 @@ module Cuprite
         range = recv.is_a?(Prism::ParenthesesNode) ? recv.body&.body&.first : recv
         return nil unless range.is_a?(Prism::RangeNode) && args.empty?
 
+        error("the value of Range#each is a Range, which is not supported (end the method or expression with nil if the value is not needed)", node) if used
         from, to, exclusive = range_bounds(range)
         count_loop(block, from, to, step: 1, inclusive: !exclusive, used: false, result: IR::Const.nil)
       end
@@ -811,6 +879,7 @@ module Cuprite
       range = node.collection
       range = range.body&.body&.first if range.is_a?(Prism::ParenthesesNode)
       error("for loops need an Integer range", node) unless range.is_a?(Prism::RangeNode)
+      error("the value of a for loop is a Range, which is not supported (end the method or expression with nil if the value is not needed)", node) if used
 
       from, to, exclusive = range_bounds(range)
       var = local_slot(target.name, target.depth)
@@ -828,18 +897,27 @@ module Cuprite
 
       with_block_scope(block) do
         var = params.empty? ? nil : local_slot(params.first)
-        counted_loop(from, to, step: step, inclusive: inclusive, var: var, used: false) do
-          compile_body(block.body, used: false)
+        # The iterator returns its receiver, or the value of a `break`.
+        counted_loop(from, to, step: step, inclusive: inclusive, var: var, used: used, initial: result) do
+          block_body([var].compact) { compile_body(block.body, used: false) }
         end
       end
-      used ? result : IR::Const.nil
     end
 
-    def counted_loop(from, to, step:, inclusive:, var:, used:)
+    # An inclusive loop stops after the iteration whose counter equals `to`
+    # rather than stepping past it: past INT_MAX / INT_MIN the counter would
+    # wrap around and still satisfy the bound.
+    def counted_loop(from, to, step:, inclusive:, var:, used:, initial: IR::Const.nil)
       counter = @fn.temp
       emit IR::Move.new(dst: counter, src: from)
       emit IR::Arith.new(dst: counter, op: :-, a: counter, b: IR::Const.int(step))
-      emit_loop(used: used) do
+      last = nil
+      if inclusive
+        last = @fn.temp
+        emit IR::Move.new(dst: last, src: IR::Const.bool(false))
+      end
+      emit_loop(used: used, initial: initial) do
+        break_unless(last, negate: true) if last
         emit IR::Arith.new(dst: counter, op: :+, a: counter, b: IR::Const.int(step))
         op = if step.positive?
                inclusive ? :<= : :<
@@ -849,6 +927,7 @@ module Cuprite
         t = @fn.temp
         emit IR::Compare.new(dst: t, op: op, a: counter, b: to)
         break_unless(t)
+        emit IR::Compare.new(dst: last, op: :==, a: counter, b: to) if last
         if var
           emit IR::Move.new(dst: var, src: counter)
           @assigned << var
@@ -887,18 +966,30 @@ module Cuprite
       @scopes.pop
     end
 
+    # Compiles one invocation of a block's body. Locals owned by the block
+    # start each invocation as nil, so those the body may read before
+    # assigning are reset at its start.
+    def block_body(params = [])
+      start = @block.size
+      yield
+      resets = @scopes.last.values.map { |n| IR::Local.new(@fn.name, n) }.select do |slot|
+        @fn.maybe_unassigned.include?(slot) && !params.include?(slot)
+      end
+      resets.reverse_each { |slot| @block.insert(start, IR::Move.new(dst: slot, src: IR::Const.nil, line: @line)) }
+    end
+
     def compile_break(node)
       error("break outside of a loop", node) if @loops.empty?
       error("break inside a context block (as, at, ...) is not supported; use next", node) if @loops.last == :context
       args = node.arguments&.arguments || []
       error("break with several values is not supported", node) if args.size > 1
       dst = @loops.last
-      if args.size == 1
-        # Evaluate the argument even when the loop's value is unused: it can
-        # have side effects (e.g. `break Cuprite.command("...")`).
-        v = compile_expr(args.first, used: dst.is_a?(IR::Local))
-        emit IR::Move.new(dst: dst, src: v) if dst.is_a?(IR::Local)
-      end
+      # Evaluate the argument even when the loop's value is unused: it can
+      # have side effects (e.g. `break Cuprite.command("...")`). A bare break
+      # makes the loop's value nil.
+      store = dst.is_a?(IR::Local)
+      v = args.size == 1 ? compile_expr(args.first, used: store) : IR::Const.nil
+      emit IR::Move.new(dst: dst, src: v) if store
       emit IR::Break.new
       IR::Const.nil
     end
@@ -918,7 +1009,7 @@ module Cuprite
       recv = node.receiver
 
       if recv && ARITH_OPS.include?(name) && args.size == 1 && !node.block
-        a = compile_expr(recv)
+        a = compile_operand(recv, before: args.first)
         b = compile_expr(args.first)
         folded = fold(name, a, b)
         return folded if folded
@@ -928,7 +1019,7 @@ module Cuprite
         return dst
       end
       if recv && COMPARE_OPS.include?(name) && args.size == 1
-        a = compile_expr(recv)
+        a = compile_operand(recv, before: args.first)
         b = compile_expr(args.first)
         dst = @fn.temp
         emit IR::Compare.new(dst: dst, op: name, a: a, b: b)
@@ -938,12 +1029,20 @@ module Cuprite
         case name
         when :-@
           v = compile_expr(recv)
-          return int_literal(-v.value, node) if v.is_a?(IR::Const) && v.type == :int
+          folded = fold(:-, IR::Const.int(0), v)
+          return folded if folded
 
           dst = @fn.temp
           emit IR::Arith.new(dst: dst, op: :-, a: IR::Const.int(0), b: v)
           return dst
-        when :+@ then return compile_expr(recv)
+        when :+@
+          v = compile_expr(recv)
+          return v if v.is_a?(IR::Const) && v.type == :int
+
+          # x + 0: a plain copy, but type-checked like other arithmetic.
+          dst = @fn.temp
+          emit IR::Arith.new(dst: dst, op: :+, a: v, b: IR::Const.int(0))
+          return dst
         when :!
           dst = @fn.temp
           emit IR::Not.new(dst: dst, src: compile_expr(recv))
@@ -978,40 +1077,62 @@ module Cuprite
       error("undefined method '#{name}'", node)
     end
 
+    # Compiles `node`, copying the result if evaluating `later` (compiled
+    # after it) could change the variable it reads.
+    def compile_operand(node, before:)
+      v = compile_expr(node)
+      pure?(before) ? v : stable(v)
+    end
+
     def compile_print(node, args, kind, used: false)
       error("#{kind} does not take a block", node) if node.block
       if kind == :puts
-        lines = args.empty? ? [[]] : args.map { |a| print_parts(a, :to_s) }
+        lines = args.empty? ? [[]] : print_args(args, :to_s)
         emit IR::Print.new(lines: lines)
         return IR::Const.nil
       end
 
-      lines = args.map { |a| print_parts(a, :inspect) }
+      lines = print_args(args, :inspect)
       emit IR::Print.new(lines: lines) unless lines.empty?
       return IR::Const.nil if args.empty? || !used
 
       error("p with several arguments returns an Array, which is not supported", node) if args.size > 1
-      lines.first.size == 1 && lines.first.first.is_a?(Array) ? lines.first.first.first : IR::Const.nil
+      unless lines.first.size == 1 && lines.first.first.is_a?(Array)
+        error("p with a String argument returns a String, which is not supported", node)
+      end
+      lines.first.first.first
+    end
+
+    # Printed lines for `args`. Values are read only when the Print runs, so
+    # a value is snapshotted if a later argument could change it.
+    def print_args(args, mode)
+      args.each_with_index.map do |a, i|
+        print_parts(a, mode, snapshot: !args[(i + 1)..].all? { |later| pure?(later) })
+      end
     end
 
     # Parts of one printed line for argument node `arg`.
-    def print_parts(arg, mode)
+    def print_parts(arg, mode, snapshot: false)
       case arg
       when Prism::StringNode
         [mode == :inspect ? arg.unescaped.inspect : arg.unescaped]
       when Prism::InterpolatedStringNode
         parts = []
         parts << '"' if mode == :inspect
-        arg.parts.each do |part|
+        arg.parts.each_with_index do |part, i|
           case part
           when Prism::StringNode
             parts << (mode == :inspect ? arg_inspect_inner(part.unescaped) : part.unescaped)
           when Prism::EmbeddedStatementsNode
             sub = part.statements&.body || []
             if sub.size == 1 && sub.first.is_a?(Prism::StringNode)
-              parts << sub.first.unescaped
+              str = sub.first.unescaped
+              parts << (mode == :inspect ? arg_inspect_inner(str) : str)
             else
-              parts << [compile_body(part.statements), :to_s]
+              v = compile_body(part.statements)
+              later_pure = arg.parts[(i + 1)..].all? { |q| q.is_a?(Prism::StringNode) || pure?(q.statements) }
+              v = stable(v) if snapshot || !later_pure
+              parts << [v, :to_s]
             end
           else
             error("unsupported string interpolation", part)
@@ -1020,7 +1141,8 @@ module Cuprite
         parts << '"' if mode == :inspect
         parts
       else
-        [[compile_expr(arg), mode]]
+        v = compile_expr(arg)
+        [[snapshot ? stable(v) : v, mode]]
       end
     end
 

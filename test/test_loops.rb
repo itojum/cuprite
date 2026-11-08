@@ -161,6 +161,56 @@ class TestLoops < Minitest::Test
     assert_includes sim.log.last, "chain limit"
   end
 
+  def test_inclusive_loops_stop_at_the_32_bit_limits
+    assert_same_output(<<~RUBY)
+      2147483647.upto(2147483647) { |i| p i }
+      2147483646.upto(2147483647) { |i| next if i == 2147483647; p i }
+      (-2147483647).downto(-2147483648) { |i| p i }
+      (2147483646..2147483647).each { |i| p i }
+      for x in -2147483648..-2147483647 do p x end
+      (-2147483648...-2147483646).each { |i| p i }
+      p(-2147483648.upto(-2147483648) { |i| p i })
+    RUBY
+  end
+
+  def test_iterator_value_after_break
+    assert_same_output(<<~RUBY)
+      p(3.times { break })
+      p(3.times { |i| break i * 5 if i == 1 })
+      p(1.upto(4) { |i| break i if i == 3 })
+      p(4.downto(1) { break })
+      p 2.times { }
+      p 1.upto(2) { }
+      r = 3.times { |i| next if i == 0 }
+      p r
+    RUBY
+  end
+
+  def test_block_locals_start_each_invocation_as_nil
+    assert_same_output(<<~RUBY)
+      3.times { |i| y = 7 if i == 0; p y }
+      n = 0
+      loop do
+        n += 1
+        z = n if n == 1
+        p z
+        break if n == 2
+      end
+      2.times do |a|
+        2.times { |b| w = a + b if b == 0; p w }
+      end
+      x = 1
+      2.times { |i| x = i if i == 1; p x }
+    RUBY
+  end
+
+  def test_using_a_range_value_is_rejected
+    assert_compile_error(/Range#each is a Range/, "r = (1..2).each {}\np r")
+    assert_compile_error(/for loop is a Range/, "r = (for x in 1..2 do end)\np r")
+    assert_compile_error(/Range#each is a Range/, "def f\n  (1..2).each { }\nend\nf")
+    assert_same_output("def f\n  (1..2).each { |i| p i }\n  nil\nend\np f\n")
+  end
+
   def test_errors
     assert_compile_error(/break outside of a loop/, "break")
     assert_compile_error(/next outside of a loop/, "def f\n  next\nend")
