@@ -168,6 +168,14 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
   Absolute coordinates are restored exactly; relative ones (`~`, `^`) and
   selectors are re-evaluated against the state at resume time, consistent with
   re-evaluating `at @s` each tick. No extra state is stored.
+- **Context inherited through calls**: a suspended callee's callers are
+  suspended too (waiting for it), so resumption starts at the **outermost
+  suspended function**. Each level re-applies the context blocks that enclose
+  its own suspension point (the call), then calls the next level's resume
+  function. For example, a wait inside `skill` called from
+  `positioned("100 64 100") { skill }` resumes at `100 64 100`. This costs one
+  function call per level on each resume, with no extra state and no code
+  duplication.
 - Entity selectors never match fake score holders, so tasks without an
   executing entity have a separate dispatch path, run as the server:
   `execute if score $server cuprite.pc.<fn> matches 1.. run function <ns>:__resume/<fn>`
