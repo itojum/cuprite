@@ -679,7 +679,16 @@ module Cuprite
           # Part of this function command: not charged to the chain budget.
           r.word
           id = r.word
-          raise TailCall.new(id, function_args(r), ctx)
+          begin
+            args = function_args(r)
+          rescue CommandError
+            # Bad macro arguments fail the function command, so the
+            # `return run` returns 0 and this function stops here.
+            raise if strict
+
+            raise ReturnSignal.new(false, 0)
+          end
+          raise TailCall.new(id, args, ctx)
         end
         s, v = execute_line(r.rest, ctx, charge: false)
         raise ReturnSignal.new(s, s ? v : 0)
