@@ -1,0 +1,105 @@
+# frozen_string_literal: true
+
+require "set"
+
+module Cuprite
+  # Cuprite IR: three-address instructions over score slots, with structured
+  # control flow (blocks nest instead of jumping, because .mcfunction has no
+  # goto; each nested block becomes its own function in code generation).
+  module IR
+    # --- Operands ----------------------------------------------------------
+
+    # A local variable or compiler temporary of function `fn`.
+    Local = Data.define(:fn, :name) do
+      def to_s = "#{fn}.#{name}"
+    end
+
+    # A global variable ($name), persistent across runs (design §4.4).
+    Global = Data.define(:name) do
+      def to_s = name
+    end
+
+    # A compile-time constant. value is an Integer (booleans are 0/1) or nil.
+    Const = Data.define(:value, :type) do
+      def self.int(v) = new(v, :int)
+      def self.bool(v) = new(v ? 1 : 0, :bool)
+      def self.nil = new(nil, :nil)
+      def to_s = type == :nil ? "nil" : (type == :bool ? (value == 1).to_s : value.to_s)
+    end
+
+    # --- Instructions ------------------------------------------------------
+
+    def self.instr(*fields)
+      Struct.new(*fields, :line, keyword_init: true)
+    end
+
+    # dst = src
+    Move = instr(:dst, :src)
+    # Return src from the current function.
+    Return = instr(:src)
+
+    # --- Program structure -------------------------------------------------
+
+    class Function
+      attr_reader :name, :kind, :params, :line, :locals, :maybe_unassigned
+      attr_accessor :body
+
+      # kind: :main, :method, :on_load or :on_tick
+      def initialize(name, kind:, params: [], line: nil)
+        @name = name
+        @kind = kind
+        @params = params
+        @line = line
+        @body = []
+        @locals = Set.new(params)
+        # Locals that may be read before being assigned; they read as nil and
+        # are reset on entry.
+        @maybe_unassigned = Set.new
+        @temp_count = 0
+      end
+
+      def local(name)
+        var = Local.new(self.name, name)
+        @locals << var
+        var
+      end
+
+      def temp
+        @temp_count += 1
+        local("%#{@temp_count}")
+      end
+
+      def entry_point? = kind != :method
+    end
+
+    class Program
+      attr_reader :functions, :globals
+
+      def initialize
+        @functions = {}
+        @globals = Set.new
+      end
+
+      def add_function(fn)
+        @functions[fn.name] = fn
+      end
+
+      def main = @functions.fetch("main")
+    end
+
+    # Visits every instruction, descending into nested blocks.
+    def self.each_instr(block, &visit)
+      block.each do |ins|
+        visit.call(ins)
+        nested_blocks(ins).each { |b| each_instr(b, &visit) }
+      end
+    end
+
+    def self.nested_blocks(ins)
+      ins.class.members.filter_map do |m|
+        v = ins[m]
+        v if v.is_a?(Array) && v.all? { |x| x.is_a?(Struct) }
+      end
+    end
+  end
+end

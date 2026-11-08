@@ -1,0 +1,6 @@
+/build/
+/pkg/
+/tmp/
+Gemfile.lock
+/.bundle/
+/vendor/
