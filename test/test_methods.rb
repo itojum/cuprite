@@ -276,4 +276,16 @@ class TestMethods < Minitest::Test
     assert_equal [], run_mc("")
     assert_equal [], run_mc("# nothing here\n")
   end
+
+  def test_setter_cannot_change_the_assignment_value
+    assert_same_output(<<~RUBY)
+      def value=(v)
+        $g = 99
+        0
+      end
+      $g = 7
+      p(self.value = $g)
+      p $g
+    RUBY
+  end
 end

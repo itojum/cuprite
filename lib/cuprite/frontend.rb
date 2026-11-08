@@ -201,8 +201,10 @@ module Cuprite
         # Snapshot each argument as it is evaluated: a later argument may
         # change a variable an earlier one read (f(x, x = 2)). A self-call
         # also assigns this frame's own parameters one by one, so there even
-        # the last argument must not be a parameter slot.
-        last = a.equal?(args.last) && fn.name != @fn.name
+        # the last argument must not be a parameter slot, and a setter's
+        # right-hand side is read again after the call as the expression's
+        # value, so the setter must not be able to change it.
+        last = a.equal?(args.last) && fn.name != @fn.name && !setter_assignment?(node)
         last ? v : stable(v)
       end
       ops += fn.defaults[args.size..]
