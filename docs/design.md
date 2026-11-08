@@ -341,9 +341,14 @@ end
   <ns>.owner.<block> = <caller> <ns>.inv.<block> run scoreboard players add
   ...`). Concurrent callers therefore never wait for each other's children.
 - **Exceptions**: other entities keep running. A child that ends with an
-  uncaught exception records its kind in `<ns>.exc.<block>` and keeps its
-  owner ID until the join collects it. After all have finished, the first
-  exception collected for this invocation is re-raised in the caller.
+  uncaught exception writes its kind to storage keyed by the owner's
+  invocation ID (`<ns>:__runtime pending."<id>"`, via a macro; only on this
+  failure path) and then releases its task slot immediately, so a later
+  invocation reusing the slot can never overwrite an uncollected failure.
+  After all children have finished, the caller reads and deletes its own
+  `pending."<id>"` entry and re-raises the first exception recorded there.
+  Entries orphaned by a caller that disappeared are cleared by the
+  build-hash reset (§6.6).
 - Blocks may read **and assign** outer local variables. Concurrent tasks
   assigning the same variable share one fake player.
 - **Detached blocks**: `as(selector, wait: false) { ... }` starts a task on
