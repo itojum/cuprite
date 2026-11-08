@@ -98,7 +98,7 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
 ### 4.4 Persistent state
 
 - **Global variables** (`$count`) live on fake player `$count` in objective
-  `cuprite.globals`. They survive `/reload` and world restarts. An unassigned
+  `<ns>.globals`. They survive `/reload` and world restarts. An unassigned
   global reads as `nil`.
 - **Declared scoreboards** (§9.1) can target fake players as well, for state
   shared with other data packs or command blocks.
@@ -106,8 +106,13 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
 
 ### 4.5 Naming of generated functions
 
-- Each Ruby method `foo` is emitted as `<ns>:foo` (stable, callable from
-  command blocks and other packs without arguments).
+- Each Ruby method `foo` whose name is a valid resource path segment
+  (`[a-z0-9_]`, not starting with `__`) is emitted as `<ns>:foo` (stable,
+  callable from command blocks and other packs without arguments).
+- Methods whose names are valid Ruby but not valid resource paths (`ready?`,
+  `activate!`, `value=`, names with uppercase letters) are emitted under
+  `<ns>:__m/<index>`, numbered by the compiler. They are callable from Ruby
+  but have no stable exported name.
 - Compiler-internal functions live under `<ns>:__*`.
 - **Reserved names**: defining a method named `main`, any `__*` name, or any
   Kernel control method (§9.0) is a compile error, so user methods can never
@@ -116,7 +121,12 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
 
 ## 5. Variables and calls
 
-- Local variables are fake players in objective `cuprite.vars`
+- **All compiler-owned state is scoped to the pack namespace**: objectives
+  are named `<ns>.<purpose>` (`<ns>.vars`, `<ns>.globals`, `<ns>.rt`,
+  `<ns>.pc.<fn>`, …) and storage lives in `<ns>:__runtime`. Two Cuprite
+  packs in one world therefore never share task slots, and one pack's
+  build-hash reset (§6.6) only discards its own tasks.
+- Local variables are fake players in objective `<ns>.vars`
   (e.g. `$fib.n`).
 - Call graph SCCs are computed. Only functions in a **recursive SCC** save and
   restore their locals around calls, using a stack in data storage. Initially
@@ -153,7 +163,7 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
   is **suspendable**.
 - When suspended, its resume point and live locals are stored as scores:
   - on the **executing entity** (`@s`), in per-function objectives such as
-    `cuprite.pc.<fn>` and `cuprite.l.<fn>.<var>`;
+    `<ns>.pc.<fn>` and `<ns>.l.<fn>.<var>`;
   - on a **fake player** when there is no executing entity.
 - Each tick, suspended tasks are resumed with
   `execute as <entities with an active task> at @s run function <ns>:__resume/...`.
@@ -178,7 +188,7 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
   duplication.
 - Entity selectors never match fake score holders, so tasks without an
   executing entity have a separate dispatch path, run as the server:
-  `execute if score $server cuprite.pc.<fn> matches 1.. run function <ns>:__resume/<fn>`
+  `execute if score $server <ns>.pc.<fn> matches 1.. run function <ns>:__resume/<fn>`
   (the fake player `$server` holds the state in the same per-function objectives)
   for each suspendable function that can run without an entity.
 - Within a tick, `on_tick` runs first, then suspended tasks are resumed.
@@ -321,10 +331,19 @@ end
 - The block is compiled to a separate function invoked via `execute ... run function`.
 - **The block waits** until every entity's task has finished. While waiting,
   the caller recounts, each tick, the entities that still exist and still have
-  an active task for that block, and proceeds when the count reaches zero.
-  Removed entities and offline players therefore never block progress.
-- **Exceptions**: other entities keep running. After all have finished, the
-  first exception raised is re-raised in the caller.
+  an active task for that block **owned by this invocation**, and proceeds
+  when the count reaches zero. Removed entities and offline players therefore
+  never block progress.
+- **Ownership**: each waiting block invocation takes a fresh invocation ID
+  from a global counter (`$next_id <ns>.rt`). Every child task it starts
+  stores that ID in `<ns>.owner.<block>`, and the join counts only entities
+  whose owner score equals the caller's ID (`execute as @e[...] if score @s
+  <ns>.owner.<block> = <caller> <ns>.inv.<block> run scoreboard players add
+  ...`). Concurrent callers therefore never wait for each other's children.
+- **Exceptions**: other entities keep running. A child that ends with an
+  uncaught exception records its kind in `<ns>.exc.<block>` and keeps its
+  owner ID until the join collects it. After all have finished, the first
+  exception collected for this invocation is re-raised in the caller.
 - Blocks may read **and assign** outer local variables. Concurrent tasks
   assigning the same variable share one fake player.
 - **Detached blocks**: `as(selector, wait: false) { ... }` starts a task on
