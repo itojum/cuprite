@@ -37,7 +37,8 @@ module Cuprite
         "scoreboard objectives add #{names.vars} dummy",
         "scoreboard objectives add #{names.globals} dummy",
         "scoreboard objectives add #{rt} dummy",
-        "execute unless score $debug #{rt} matches 0..1 run scoreboard players set $debug #{rt} #{@debug ? 1 : 0}"
+        "execute unless score $debug #{rt} matches 0..1 run scoreboard players set $debug #{rt} #{@debug ? 1 : 0}",
+        "scoreboard players set $ctl #{rt} 0"
       ]
       @codegen.constants.sort.each do |c|
         lines << "scoreboard players set #{names.const(c)} #{rt} #{c}"

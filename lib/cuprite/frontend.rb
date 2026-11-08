@@ -47,14 +47,20 @@ module Cuprite
     # --- Context -----------------------------------------------------------
 
     def with_function(fn)
-      saved = [@fn, @block, @assigned, @terminated]
+      saved = [@fn, @block, @assigned, @scopes, @loops, @terminated]
       @fn = fn
       @block = fn.body
       @assigned = Set.new(fn.params)
+      # Ruby local scopes, innermost last: maps a Ruby name to its slot name.
+      # The method scope maps names to themselves.
+      @scopes = [{}]
+      # Result slots of the enclosing loops, innermost last.
+      @loops = []
+      # Whether control has unconditionally left the method (return).
       @terminated = false
       yield
     ensure
-      @fn, @block, @assigned, @terminated = saved
+      @fn, @block, @assigned, @scopes, @loops, @terminated = saved
     end
 
     # Emits into `block` while the given block runs.
@@ -247,12 +253,19 @@ module Cuprite
       when Prism::IntegerNode then int_literal(node.value, node)
       when Prism::ParenthesesNode then compile_body(node.body, used: used)
       when Prism::StatementsNode then compile_body(node, used: used)
-      when Prism::LocalVariableReadNode then read_local(node.name)
-      when Prism::LocalVariableWriteNode then assign(local_slot(node.name), node.value)
+      when Prism::LocalVariableReadNode then read_local(node.name, node.depth)
+      when Prism::LocalVariableWriteNode then assign(local_slot(node.name, node.depth), node.value)
       when Prism::LocalVariableOperatorWriteNode
-        op_assign(local_slot(node.name), read_local(node.name), node_operator(node), node.value)
-      when Prism::LocalVariableOrWriteNode then or_assign(local_slot(node.name), read_local(node.name), node.value)
-      when Prism::LocalVariableAndWriteNode then and_assign(local_slot(node.name), read_local(node.name), node.value)
+        op_assign(local_slot(node.name, node.depth), read_local(node.name, node.depth), node_operator(node), node.value)
+      when Prism::LocalVariableOrWriteNode
+        or_assign(local_slot(node.name, node.depth), read_local(node.name, node.depth), node.value)
+      when Prism::LocalVariableAndWriteNode
+        and_assign(local_slot(node.name, node.depth), read_local(node.name, node.depth), node.value)
+      when Prism::WhileNode then compile_while(node, until_loop: false, used: used)
+      when Prism::UntilNode then compile_while(node, until_loop: true, used: used)
+      when Prism::ForNode then compile_for(node, used: used)
+      when Prism::BreakNode then compile_break(node)
+      when Prism::NextNode then compile_next(node)
       when Prism::GlobalVariableReadNode then global(node.name)
       when Prism::GlobalVariableWriteNode then assign(global(node.name), node.value)
       when Prism::GlobalVariableOperatorWriteNode
@@ -302,10 +315,13 @@ module Cuprite
 
     # --- Variables ---------------------------------------------------------
 
-    def local_slot(name) = @fn.local(name.to_s)
+    def local_slot(name, depth = 0)
+      scope = @scopes[-1 - depth] or error("cannot resolve local variable #{name}")
+      @fn.local(scope.fetch(name.to_s, name.to_s))
+    end
 
-    def read_local(name)
-      slot = local_slot(name)
+    def read_local(name, depth = 0)
+      slot = local_slot(name, depth)
       @fn.maybe_unassigned << slot unless @assigned.include?(slot)
       slot
     end
@@ -518,6 +534,214 @@ module Cuprite
       v.value
     end
 
+    # --- Loops (design §6.1: loops run to completion within the tick) -----
+
+    # Runs the given block as a Loop body. Yields to emit the loop header
+    # inside the body; the result slot (if used) holds nil unless a `break`
+    # supplies a value.
+    def emit_loop(used:, initial: IR::Const.nil)
+      dst = used ? @fn.temp : nil
+      emit IR::Move.new(dst: dst, src: initial) if dst
+      before = @assigned.dup
+      outer_terminated = @terminated
+      @loops << dst
+      body = into([]) { yield }
+      @loops.pop
+      # A loop body may not run at all: its assignments are not definite and
+      # a return inside it does not end the code after the loop.
+      @assigned = before
+      @terminated = outer_terminated
+      emit IR::Loop.new(body: body)
+      dst || IR::Const.nil
+    end
+
+    # Emits `break unless cond` (or `break if cond` when negate).
+    def break_unless(cond, negate: false)
+      brk = [IR::Break.new(line: @line)]
+      if negate
+        emit IR::If.new(cond: cond, then_body: brk, else_body: [])
+      else
+        emit IR::If.new(cond: cond, then_body: [], else_body: brk)
+      end
+    end
+
+    def compile_while(node, until_loop:, used:)
+      if node.respond_to?(:begin_modifier?) && node.begin_modifier?
+        error("begin ... end while is not supported; use loop with break", node)
+      end
+
+      emit_loop(used: used) do
+        break_unless(compile_expr(node.predicate), negate: until_loop)
+        compile_body(node.statements, used: false)
+      end
+    end
+
+    def compile_loop_block(block, used:)
+      with_block_scope(block) do
+        emit_loop(used: used) { block_body { compile_body(block.body, used: false) } }
+      end
+    end
+
+    # Integer#times / upto / downto and Range#each with a block.
+    def compile_iterator(node, name, recv, args, used:)
+      block = node.block
+      return nil unless block.is_a?(Prism::BlockNode)
+
+      case name
+      when :times
+        return nil unless args.empty?
+
+        n = stable(compile_expr(recv))
+        count_loop(block, IR::Const.int(0), n, step: 1, inclusive: false, used: used, result: n)
+      when :upto, :downto
+        return nil unless args.size == 1
+
+        from = stable(compile_expr(recv))
+        to = stable(compile_expr(args.first))
+        count_loop(block, from, to, step: name == :upto ? 1 : -1, inclusive: true, used: used, result: from)
+      when :each
+        range = recv.is_a?(Prism::ParenthesesNode) ? recv.body&.body&.first : recv
+        return nil unless range.is_a?(Prism::RangeNode) && args.empty?
+
+        error("the value of Range#each is a Range, which is not supported (end the method or expression with nil if the value is not needed)", node) if used
+        from, to, exclusive = range_bounds(range)
+        count_loop(block, from, to, step: 1, inclusive: !exclusive, used: false, result: IR::Const.nil)
+      end
+    end
+
+    def range_bounds(range)
+      error("endless and beginless ranges cannot be iterated", range) unless range.left && range.right
+
+      from = stable(compile_expr(range.left))
+      to = stable(compile_expr(range.right))
+      exclusive = range.respond_to?(:exclude_end?) ? range.exclude_end? : range.operator_loc.slice == "..."
+      [from, to, exclusive]
+    end
+
+    # for i in a..b
+    def compile_for(node, used:)
+      target = node.index
+      error("for needs a single loop variable", target) unless target.is_a?(Prism::LocalVariableTargetNode)
+      range = node.collection
+      range = range.body&.body&.first if range.is_a?(Prism::ParenthesesNode)
+      error("for loops need an Integer range", node) unless range.is_a?(Prism::RangeNode)
+      error("the value of a for loop is a Range, which is not supported (end the method or expression with nil if the value is not needed)", node) if used
+
+      from, to, exclusive = range_bounds(range)
+      var = local_slot(target.name, target.depth)
+      counted_loop(from, to, step: 1, inclusive: !exclusive, var: var, used: false) do
+        compile_body(node.statements, used: false)
+      end
+      IR::Const.nil
+    end
+
+    # A loop with a hidden counter from `from` towards `to`; the block's
+    # first parameter (if any) receives the counter.
+    def count_loop(block, from, to, step:, inclusive:, used:, result:)
+      params = block_param_names(block)
+      error("this block takes at most one parameter", block) if params.size > 1
+
+      with_block_scope(block) do
+        var = params.empty? ? nil : local_slot(params.first)
+        # The iterator returns its receiver, or the value of a `break`.
+        counted_loop(from, to, step: step, inclusive: inclusive, var: var, used: used, initial: result) do
+          block_body([var].compact) { compile_body(block.body, used: false) }
+        end
+      end
+    end
+
+    # An inclusive loop stops after the iteration whose counter equals `to`
+    # rather than stepping past it: past INT_MAX / INT_MIN the counter would
+    # wrap around and still satisfy the bound.
+    def counted_loop(from, to, step:, inclusive:, var:, used:, initial: IR::Const.nil)
+      counter = @fn.temp
+      emit IR::Move.new(dst: counter, src: from)
+      emit IR::Arith.new(dst: counter, op: :-, a: counter, b: IR::Const.int(step))
+      last = nil
+      if inclusive
+        last = @fn.temp
+        emit IR::Move.new(dst: last, src: IR::Const.bool(false))
+      end
+      emit_loop(used: used, initial: initial) do
+        break_unless(last, negate: true) if last
+        emit IR::Arith.new(dst: counter, op: :+, a: counter, b: IR::Const.int(step))
+        op = if step.positive?
+               inclusive ? :<= : :<
+             else
+               inclusive ? :>= : :>
+             end
+        t = @fn.temp
+        emit IR::Compare.new(dst: t, op: op, a: counter, b: to)
+        break_unless(t)
+        emit IR::Compare.new(dst: last, op: :==, a: counter, b: to) if last
+        if var
+          emit IR::Move.new(dst: var, src: counter)
+          @assigned << var
+        end
+        yield
+      end
+    end
+
+    def block_param_names(block)
+      bp = block.parameters
+      return [] if bp.nil?
+      error("numbered block parameters are not supported", block) unless bp.is_a?(Prism::BlockParametersNode)
+
+      ps = bp.parameters
+      return [] if ps.nil?
+
+      extra = !ps.optionals.empty? || ps.rest || !ps.posts.empty? || !ps.keywords.empty? || ps.keyword_rest || ps.block
+      error("only simple block parameters are supported", block) if extra
+
+      ps.requireds.map do |r|
+        error("destructuring block parameters are not supported", r) unless r.is_a?(Prism::RequiredParameterNode)
+
+        r.name.to_s
+      end
+    end
+
+    # Opens a Ruby block scope: the block's own locals (parameters and
+    # variables first assigned inside it) get slots distinct from any
+    # outer variable with the same name.
+    def with_block_scope(block)
+      @block_scopes = (@block_scopes || 0) + 1
+      id = @block_scopes
+      @scopes << block.locals.to_h { |n| [n.to_s, "#{n}@#{id}"] }
+      yield
+    ensure
+      @scopes.pop
+    end
+
+    # Compiles one invocation of a block's body. Locals owned by the block
+    # start each invocation as nil, so those the body may read before
+    # assigning are reset at its start.
+    def block_body(params = [])
+      start = @block.size
+      yield
+      resets = @scopes.last.values.map { |n| IR::Local.new(@fn.name, n) }.select do |slot|
+        @fn.maybe_unassigned.include?(slot) && !params.include?(slot)
+      end
+      resets.reverse_each { |slot| @block.insert(start, IR::Move.new(dst: slot, src: IR::Const.nil, line: @line)) }
+    end
+
+    def compile_break(node)
+      error("break outside of a loop", node) if @loops.empty?
+      args = node.arguments&.arguments || []
+      error("break with several values is not supported", node) if args.size > 1
+      dst = @loops.last
+      v = args.size == 1 ? compile_expr(args.first) : IR::Const.nil
+      emit IR::Move.new(dst: dst, src: v) if dst
+      emit IR::Break.new
+      IR::Const.nil
+    end
+
+    def compile_next(node)
+      error("next outside of a loop", node) if @loops.empty?
+      (node.arguments&.arguments || []).each { |a| compile_expr(a, used: false) }
+      emit IR::Next.new
+      IR::Const.nil
+    end
+
     # --- Calls -------------------------------------------------------------
 
     def compile_call(node, used:)
@@ -567,10 +791,17 @@ module Cuprite
         end
       end
 
+      if recv && node.block && (result = compile_iterator(node, name, recv, args, used: used))
+        return result
+      end
+
       if recv.nil? || recv.is_a?(Prism::SelfNode)
         case name
         when :puts then return compile_print(node, args, :puts)
         when :p then return compile_print(node, args, :p, used: used)
+        when :loop
+          error("loop needs a block", node) unless node.block.is_a?(Prism::BlockNode) && args.empty?
+          return compile_loop_block(node.block, used: used)
         end
         result = compile_method_call(node, name, args)
         return result if result

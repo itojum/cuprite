@@ -15,6 +15,8 @@ module Cuprite
   #   enclosing function too (return, and the cases added by later
   #   constructs). The caller then runs `execute if function <block> run
   #   return ...` to keep unwinding.
+  # - "$ctl <ns>.rt" says why a block is unwinding: 0 for return,
+  #   2 for break, 3 for next. Loops consume 2 and 3 and reset it to 0.
   class Codegen
     ANY = "-2147483648.."
     INT_MIN = -2_147_483_648
@@ -126,7 +128,10 @@ module Cuprite
       return if lines.empty?
 
       unwinds = may_unwind?(block)
-      if lines.size == 1 && !unwinds
+      # A single command can run in place. If it unwinds, it does so with
+      # `return ...`, which leaves the enclosing function just as well; a
+      # function at the top of a method ignores the value returned.
+      if lines.size == 1
         out << (prefix == "execute" ? lines.first : "#{prefix} run #{lines.first}")
         return
       end
@@ -145,9 +150,34 @@ module Cuprite
 
     def instr_unwinds?(ins)
       case ins
-      when IR::Return then true
+      when IR::Return, IR::Break, IR::Next then true
       when IR::If then may_unwind?(ins.then_body) || may_unwind?(ins.else_body)
+      when IR::Loop then escapes_loop?(ins.body)
       else false
+      end
+    end
+
+    # Whether control can leave a loop with this body other than by its own
+    # break: break and next are consumed by the loop.
+    def escapes_loop?(block)
+      block.any? do |ins|
+        case ins
+        when IR::Break, IR::Next then false
+        when IR::If then escapes_loop?(ins.then_body) || escapes_loop?(ins.else_body)
+        when IR::Loop then escapes_loop?(ins.body)
+        else instr_unwinds?(ins)
+        end
+      end
+    end
+
+    # Whether `next` can reach the loop with this body.
+    def has_next?(block)
+      block.any? do |ins|
+        case ins
+        when IR::Next then true
+        when IR::If then has_next?(ins.then_body) || has_next?(ins.else_body)
+        else false
+        end
       end
     end
 
@@ -162,6 +192,9 @@ module Cuprite
       when IR::Print then print(ins, out)
       when IR::Return then compile_return(ins, out)
       when IR::Call then call(ins, out)
+      when IR::Loop then compile_loop(ins, out)
+      when IR::Break then out << "return run function #{helper(:break)}"
+      when IR::Next then out << "return run function #{helper(:next)}"
       else
         raise Error, "codegen: unsupported instruction #{ins.class}"
       end
@@ -203,6 +236,60 @@ module Cuprite
     def compile_return(ins, out)
       move(:ret, ins.src, out) unless @fn.entry_point?
       out << unwind
+    end
+
+    # --- Loops -------------------------------------------------------------
+
+    # A loop is a tail-recursive function L around a body function B:
+    #
+    #   execute if function B unless score $ctl matches 3 run return run function __loop_exit
+    #   scoreboard players set $ctl 0      (only when the body uses next)
+    #   return run function L
+    #
+    # __loop_exit turns a break into a normal (0) return and keeps any other
+    # unwind going (1).
+    def compile_loop(ins, out)
+      @block_count += 1
+      path = "__b/#{@block_count}"
+      loop_fn = names.function(path)
+      body = compile_nested(ins.body)
+      lines = []
+      if may_unwind?(ins.body)
+        body_fn = new_block_function(body + ["return 0"])
+        lines << "execute if function #{body_fn} unless score #{rt(:ctl)} matches 3 " \
+                 "run return run function #{helper(:loop_exit)}"
+        lines << "scoreboard players set #{rt(:ctl)} 0" if has_next?(ins.body)
+      else
+        # Without break the loop never ends normally; it can only be cut short
+        # by the command chain limit.
+        lines.concat(body)
+      end
+      lines << "return run function #{loop_fn}"
+      @pack.add_function(path, lines)
+      out << if escapes_loop?(ins.body)
+               "execute if function #{loop_fn} run #{unwind}"
+             else
+               "function #{loop_fn}"
+             end
+    end
+
+    def rt(register) = "$#{register} #{names.rt}"
+
+    # Shared runtime helper functions, emitted on first use.
+    def helper(name)
+      path = "__#{name}"
+      unless @pack.function?(path)
+        lines = case name
+                when :break then ["scoreboard players set #{rt(:ctl)} 2", "return 1"]
+                when :next then ["scoreboard players set #{rt(:ctl)} 3", "return 1"]
+                when :loop_exit
+                  ["execute unless score #{rt(:ctl)} matches 2 run return 1",
+                   "scoreboard players set #{rt(:ctl)} 0",
+                   "return 0"]
+                end
+        @pack.add_function(path, lines)
+      end
+      names.function(path)
     end
 
     # --- Calls -------------------------------------------------------------
