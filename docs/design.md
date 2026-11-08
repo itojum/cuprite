@@ -68,6 +68,9 @@ world: ~/.minecraft/saves/MyWorld   # optional; if set, the pack is also copied 
 - An integer literal outside the 32-bit range is a **compile error**.
 - Division and modulo by a non-constant divisor get a runtime zero check that
   raises `ZeroDivisionError`.
+- Arithmetic and ordering comparisons on a value whose type includes `nil`
+  get a runtime check that raises `NoMethodError` (as Ruby does for
+  `nil + 1`).
 - Representation: booleans are `0`/`1`; `nil` is an **unset score**.
   Type combinations that inference cannot represent (e.g. `Integer | true`)
   are compile errors.
@@ -261,6 +264,8 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
 - No static exception analysis: users avoid unhandled errors with `rescue`.
 - An uncaught exception stops the task. It is printed only in debug mode, and
   is always recorded in storage, viewable with `/function <ns>:debug/last_error`.
+  Entry points and exported methods run with `/function <ns>:<name>` are
+  boundaries for this; calls from Ruby code are not.
 
 ## 8. Output and debug mode
 

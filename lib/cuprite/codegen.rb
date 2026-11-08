@@ -16,7 +16,10 @@ module Cuprite
   #   constructs). The caller then runs `execute if function <block> run
   #   return ...` to keep unwinding.
   # - "$ctl <ns>.rt" says why a block is unwinding: 0 for return,
-  #   2 for break, 3 for next. Loops consume 2 and 3 and reset it to 0.
+  #   2 for break, 3 for next, 4 for a raised exception (the halt flag of
+  #   design §7). Loops consume 2 and 3, rescue consumes 4.
+  # - "$exc <ns>.rt" holds the raised exception's class ID; its class name
+  #   and message are in storage <ns>:__runtime exc.
   class Codegen
     ANY = "-2147483648.."
     INT_MIN = -2_147_483_648
@@ -37,8 +40,23 @@ module Cuprite
 
     def generate
       @calls = CallGraph.new(@program)
+      compute_may_raise
       @program.functions.each_value { |fn| generate_function(fn) }
     end
+
+    # Internal path of a method, used for calls from Ruby code. Entry points
+    # and exported methods that may raise are wrapped (truncation detection,
+    # uncaught exceptions), so Ruby calls go to their body.
+    def body_path(name)
+      wrapped?(name) ? "__body/#{name}" : function_path(name)
+    end
+
+    def wrapped?(name)
+      @program.functions.fetch(name).entry_point? || (exported?(name) && may_raise?(name))
+    end
+
+    # Whether `name` is callable as /function <ns>:<name> (§4.5).
+    def exported?(name) = !function_path(name).start_with?("__")
 
     # Resource path of the function implementing Ruby method `name` (§4.5).
     def function_path(name)
@@ -81,6 +99,43 @@ module Cuprite
       "#{names.const(value)} #{names.rt}"
     end
 
+    def rt(register) = "$#{register} #{names.rt}"
+
+    # Text component "[ns] Class: message" for an error compound in storage.
+    def error_text(path)
+      st = names.storage
+      %({"text":"[#{names.ns}] ","color":"red","extra":[{"nbt":"#{path}.class","storage":"#{st}"},) +
+        %({"text":": "},{"nbt":"#{path}.message","storage":"#{st}"}]})
+    end
+
+    # Shared runtime helper functions, emitted on first use.
+    def helper(name)
+      path = "__#{name}"
+      unless @pack.function?(path)
+        lines = case name
+                when :break then ["scoreboard players set #{rt(:ctl)} 2", "return 1"]
+                when :next then ["scoreboard players set #{rt(:ctl)} 3", "return 1"]
+                when :truncated
+                  ["scoreboard players set #{rt(:ctl)} 0",
+                   "data remove storage #{names.storage} stack",
+                   "data modify storage #{names.storage} last_error set value " \
+                   "{class:\"truncated\",message:\"the previous run hit the command chain limit\"}",
+                   "execute if score #{rt(:debug)} matches 1 run tellraw @a " \
+                   "{\"text\":\"[#{names.ns}] previous run was truncated by the command chain limit\",\"color\":\"red\"}"]
+                when :uncaught
+                  ["data modify storage #{names.storage} last_error set from storage #{names.storage} exc",
+                   "execute if score #{rt(:debug)} matches 1 run tellraw @a #{error_text('exc')}",
+                   "scoreboard players set #{rt(:ctl)} 0"]
+                when :loop_exit
+                  ["execute unless score #{rt(:ctl)} matches 2 run return 1",
+                   "scoreboard players set #{rt(:ctl)} 0",
+                   "return 0"]
+                end
+        @pack.add_function(path, lines)
+      end
+      names.function(path)
+    end
+
     private
 
     def generate_function(fn)
@@ -91,7 +146,198 @@ module Cuprite
       fn.maybe_unassigned.each { |v| lines << "scoreboard players reset #{ref(v)}" }
       lines.concat(compile_block(fn.body))
       lines.pop if lines.last == "return 0" && fn.entry_point?
+      @pack.add_function(body_path(fn.name), lines)
+      if fn.entry_point?
+        generate_entry_wrapper(fn)
+      elsif wrapped?(fn.name)
+        generate_export_wrapper(fn)
+      end
+    end
+
+    # An exported method run as /function <ns>:<name> is an uncaught-error
+    # boundary too (§7): it records the exception and clears the halt flag.
+    # Its return value stays in $ret.
+    def generate_export_wrapper(fn)
+      @pack.add_function(function_path(fn.name), [
+        "function #{names.function(body_path(fn.name))}",
+        "execute if score #{rt(:ctl)} matches 4 run function #{helper(:uncaught)}"
+      ])
+    end
+
+    # <ns>:main, on_load, on_tick: detect a truncated previous run (§6.7),
+    # run the body, then report an uncaught exception (§7).
+    def generate_entry_wrapper(fn)
+      lines = [
+        "execute if score #{rt(:running)} matches 1 run function #{helper(:truncated)}",
+        "scoreboard players set #{rt(:running)} 1",
+        "function #{names.function(body_path(fn.name))}"
+      ]
+      lines << "execute if score #{rt(:ctl)} matches 4 run function #{helper(:uncaught)}" if may_raise?(fn.name)
+      lines << "scoreboard players set #{rt(:running)} 0"
       @pack.add_function(function_path(fn.name), lines)
+    end
+
+    # --- Exceptions --------------------------------------------------------
+
+    def compute_may_raise
+      @may_raise = Set.new
+      loop do
+        changed = false
+        @program.functions.each_value do |fn|
+          next if @may_raise.include?(fn.name)
+
+          found = false
+          IR.each_instr(fn.body) { |ins| found ||= raises_directly?(ins) }
+          if found
+            @may_raise << fn.name
+            changed = true
+          end
+        end
+        break unless changed
+      end
+    end
+
+    def may_raise?(name) = @may_raise.include?(name)
+
+    def raises_directly?(ins)
+      case ins
+      when IR::Raise then true
+      when IR::Call then may_raise?(ins.fn)
+      when IR::Arith then arith_checks?(ins)
+      when IR::Compare then compare_checks?(ins)
+      else false
+      end
+    end
+
+    def arith_checks?(ins)
+      return false if ins.a.is_a?(IR::Const) && ins.b.is_a?(IR::Const) && fold(ins.op, ins.a.value, ins.b.value)
+
+      [ins.a, ins.b].any? { |x| @types.nilable?(x) } ||
+        (%i[/ %].include?(ins.op) && !(ins.b.is_a?(IR::Const) && ins.b.value != 0))
+    end
+
+    def compare_checks?(ins)
+      !%i[== !=].include?(ins.op) && [ins.a, ins.b].any? { |x| @types.nilable?(x) }
+    end
+
+    # A one-command raise of klass with message.
+    def raise_command(klass, message)
+      @raisers ||= {}
+      key = [klass, message]
+      @raisers[key] ||= begin
+        path = "__raise/#{@raisers.size + 1}"
+        exc = { "class" => klass, "message" => message }
+        @pack.add_function(path, [
+          "scoreboard players set #{rt(:exc)} #{@program.exceptions.id(klass)}",
+          "data modify storage #{names.storage} exc set value #{snbt(exc)}",
+          "scoreboard players set #{rt(:ctl)} 4",
+          "return 1"
+        ])
+        names.function(path)
+      end
+      "return run function #{@raisers[key]}"
+    end
+
+    def snbt(hash)
+      "{" + hash.map { |k, v| "#{k}:#{JSON.generate(v)}" }.join(",") + "}"
+    end
+
+    def always_nil?(operand)
+      operand.is_a?(IR::Const) ? operand.value.nil? : types_of(operand) == Set[:nil]
+    end
+
+    # Raises NoMethodError when operand is nil.
+    def check_not_nil(operand, op, out)
+      return unless @types.nilable?(operand)
+
+      cmd = raise_command("NoMethodError", "undefined method '#{op}' for nil")
+      if operand.is_a?(IR::Const) || types_of(operand) == Set[:nil]
+        out << cmd
+      else
+        out << "execute unless score #{ref(operand)} matches #{ANY} run #{cmd}"
+      end
+    end
+
+    # begin/rescue/else/ensure. See the class comment for the protocol.
+    #
+    # TRY (body, rescue and else):
+    #   execute store success score F if function BODY
+    #   execute if score F matches 0 run return run function ELSE
+    #   execute unless score $ctl matches 4 run return 1
+    #   execute if score $exc matches <ids of rescue 1> run return run function RESCUE1
+    #   ...
+    #   return 1
+    #
+    # With ensure, a wrapper runs TRY, saves the pending state ($ctl, $exc,
+    # the exception's class/message and a pending return value in $ret), runs
+    # ENSURE with $ctl cleared, then restores that state and keeps unwinding
+    # if TRY did. An ensure that unwinds itself overrides the pending state.
+    def compile_try(ins, out)
+      try_lines = []
+      body = compile_nested(ins.body)
+      body_fn = new_block_function(body + ["return 0"])
+      try_lines << "execute store success score #{ref(ins.flag)} if function #{body_fn}"
+      else_lines = compile_nested(ins.else_body)
+      try_lines << if else_lines.empty?
+                     "execute if score #{ref(ins.flag)} matches 0 run return 0"
+                   else
+                     "execute if score #{ref(ins.flag)} matches 0 run return run function " \
+                       "#{new_block_function(else_lines + ['return 0'])}"
+                   end
+      try_lines << "execute unless score #{rt(:ctl)} matches 4 run return 1"
+      ins.rescues.each do |clause|
+        rescue_fn = new_block_function(["scoreboard players set #{rt(:ctl)} 0"] + compile_nested(clause.body) +
+                                       ["return 0"])
+        clause.classes.each do |klass|
+          r = @program.exceptions.range(klass)
+          try_lines << "execute if score #{rt(:exc)} matches #{r.first}..#{r.last} run return run function #{rescue_fn}"
+        end
+      end
+      try_lines << "return 1"
+      try_fn = new_block_function(try_lines)
+
+      if ins.ensure_body.empty?
+        out << "execute if function #{try_fn} run #{unwind}"
+        return
+      end
+
+      ensure_lines = compile_nested(ins.ensure_body)
+      ensure_fn = new_block_function(ensure_lines + ["return 0"])
+      st = names.storage
+      saved = ensure_slot(ins)
+      wrapper = [
+        "execute store success score #{ref(ins.flag2)} if function #{try_fn}",
+        "scoreboard players operation #{ref(ins.saved_ctl)} = #{rt(:ctl)}",
+        "scoreboard players operation #{ref(ins.saved_exc)} = #{rt(:exc)}",
+        "data remove storage #{saved}",
+        "execute if data storage #{st} exc run data modify storage #{saved} set from storage #{st} exc",
+        "scoreboard players reset #{ref(ins.saved_ret)}",
+        "execute if score #{rt(:ret)} matches #{ANY} run scoreboard players operation #{ref(ins.saved_ret)} = #{rt(:ret)}",
+        "scoreboard players set #{rt(:ctl)} 0",
+        "execute if function #{ensure_fn} run return 1",
+        "scoreboard players operation #{rt(:ctl)} = #{ref(ins.saved_ctl)}",
+        "scoreboard players operation #{rt(:exc)} = #{ref(ins.saved_exc)}",
+        "execute if data storage #{saved} run data modify storage #{st} exc set from storage #{saved}",
+        "scoreboard players reset #{rt(:ret)}",
+        "execute if score #{ref(ins.saved_ret)} matches #{ANY} run scoreboard players operation #{rt(:ret)} = #{ref(ins.saved_ret)}",
+        "execute if score #{ref(ins.flag2)} matches 1 run return 1",
+        "return 0"
+      ]
+      out << "execute if function #{new_block_function(wrapper)} run #{unwind}"
+    end
+
+    # Storage path holding the pending exception compound while `try`'s
+    # ensure runs. Recursive calls save it with the frame (see #save_locals).
+    def ensure_slot(try)
+      @ensure_slots ||= {}.compare_by_identity
+      @ensure_slots[try] ||= "#{names.storage} ensure_exc.e#{@ensure_slots.size + 1}"
+    end
+
+    # ensure slots of the current function, in a stable order.
+    def ensure_slots
+      slots = []
+      IR.each_instr(@fn.body) { |ins| slots << ensure_slot(ins) if ins.is_a?(IR::Try) && !ins.ensure_body.empty? }
+      slots
     end
 
     def compile_block(block)
@@ -150,10 +396,10 @@ module Cuprite
 
     def instr_unwinds?(ins)
       case ins
-      when IR::Return, IR::Break, IR::Next then true
+      when IR::Return, IR::Break, IR::Next, IR::Raise, IR::Try then true
       when IR::If then may_unwind?(ins.then_body) || may_unwind?(ins.else_body)
       when IR::Loop then escapes_loop?(ins.body)
-      else false
+      else raises_directly?(ins)
       end
     end
 
@@ -176,6 +422,8 @@ module Cuprite
         case ins
         when IR::Next then true
         when IR::If then has_next?(ins.then_body) || has_next?(ins.else_body)
+        when IR::Try
+          [ins.body, *ins.rescues.map(&:body), ins.else_body, ins.ensure_body].any? { |b| has_next?(b) }
         else false
         end
       end
@@ -193,6 +441,8 @@ module Cuprite
       when IR::Return then compile_return(ins, out)
       when IR::Call then call(ins, out)
       when IR::Loop then compile_loop(ins, out)
+      when IR::Raise then out << raise_command(ins.klass, ins.message)
+      when IR::Try then compile_try(ins, out)
       when IR::Break then out << "return run function #{helper(:break)}"
       when IR::Next then out << "return run function #{helper(:next)}"
       else
@@ -273,25 +523,6 @@ module Cuprite
              end
     end
 
-    def rt(register) = "$#{register} #{names.rt}"
-
-    # Shared runtime helper functions, emitted on first use.
-    def helper(name)
-      path = "__#{name}"
-      unless @pack.function?(path)
-        lines = case name
-                when :break then ["scoreboard players set #{rt(:ctl)} 2", "return 1"]
-                when :next then ["scoreboard players set #{rt(:ctl)} 3", "return 1"]
-                when :loop_exit
-                  ["execute unless score #{rt(:ctl)} matches 2 run return 1",
-                   "scoreboard players set #{rt(:ctl)} 0",
-                   "return 0"]
-                end
-        @pack.add_function(path, lines)
-      end
-      names.function(path)
-    end
-
     # --- Calls -------------------------------------------------------------
 
     def call(ins, out)
@@ -301,8 +532,9 @@ module Cuprite
       # frame's own.
       saved = recursive ? save_locals(ins, out) : []
       callee.params.zip(ins.args).each { |param, arg| move(param, arg, out) }
-      out << "function #{names.function(function_path(callee.name))}"
+      out << "function #{names.function(body_path(callee.name))}"
       restore_locals(saved, out) if recursive
+      out << "execute if score #{rt(:ctl)} matches 4 run #{unwind}" if may_raise?(callee.name)
       ret_type = @types.return_type(callee.name)
       if ret_type == Set[:nil]
         out << "scoreboard players reset #{ref(ins.dst)}"
@@ -325,6 +557,9 @@ module Cuprite
         out << "execute if score #{ref(v)} matches #{ANY} store result storage #{stack}[-1].v#{i} int 1 " \
                "run scoreboard players get #{ref(v)}"
       end
+      ensure_slots.each_with_index do |slot, i|
+        out << "execute if data storage #{slot} run data modify storage #{stack}[-1].e#{i} set from storage #{slot}"
+      end
       locals
     end
 
@@ -334,6 +569,10 @@ module Cuprite
         out << "scoreboard players reset #{ref(v)}" if @types.nilable?(v)
         out << "execute if data storage #{stack}[-1].v#{i} store result score #{ref(v)} " \
                "run data get storage #{stack}[-1].v#{i}"
+      end
+      ensure_slots.each_with_index do |slot, i|
+        out << "data remove storage #{slot}"
+        out << "execute if data storage #{stack}[-1].e#{i} run data modify storage #{slot} set from storage #{stack}[-1].e#{i}"
       end
       out << "data remove storage #{stack}[-1]"
     end
@@ -350,6 +589,19 @@ module Cuprite
 
       if a.is_a?(IR::Const) && b.is_a?(IR::Const) && (folded = fold(op, a.value, b.value))
         return move(dst, IR::Const.int(folded), out)
+      end
+
+      check_not_nil(a, op, out)
+      check_not_nil(b, op, out) unless b == a
+      # An operand that is always nil has raised unconditionally above.
+      return if always_nil?(a) || always_nil?(b)
+
+      if %i[/ %].include?(op)
+        if b.is_a?(IR::Const)
+          return out << raise_command("ZeroDivisionError", "divided by 0") if b.value.zero?
+        else
+          out << "execute if score #{ref(b)} matches 0 run #{raise_command('ZeroDivisionError', 'divided by 0')}"
+        end
       end
 
       if op == :**
@@ -444,6 +696,10 @@ module Cuprite
         [a, b].each do |x|
           error("comparison with #{op} is only defined for Integers") unless (types_of(x) - [:nil]).subset?(Set[:int])
         end
+        check_not_nil(a, op, out)
+        check_not_nil(b, op, out)
+        return if always_nil?(a) || always_nil?(b)
+
         if b.is_a?(IR::Const)
           if a.is_a?(IR::Const)
             return set_bool(dst, a.value.public_send(op, b.value), out)
