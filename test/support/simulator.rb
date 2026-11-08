@@ -199,16 +199,25 @@ module Cuprite
         @chat << r.rest
         [true, 1]
       when "say", "give", "summon", "particle", "playsound", "effect", "tp", "kill", "setblock", "title", "tag"
-        @log << "#{cmd} #{r.rest}"
+        @log << "#{cmd} #{r.rest_peek}"
         side_effect(cmd, r, ctx)
       else
         raise CommandError, "unknown command #{cmd.inspect}"
       end
     end
 
-    def side_effect(cmd, _r, ctx)
-      if cmd == "kill" && ctx.entity
-        kill(ctx.entity)
+    def side_effect(cmd, r, ctx)
+      case cmd
+      when "kill"
+        targets = r.eof? ? [ctx.entity].compact : select(r.word, ctx)
+        targets.each { |e| kill(e) }
+        return [!targets.empty?, targets.size]
+      when "tag"
+        targets = select(r.word, ctx)
+        op = r.word
+        name = r.word
+        targets.each { |e| op == "add" ? (e.tags |= [name]) : e.tags.delete(name) }
+        return [!targets.empty?, targets.size]
       end
       [true, 1]
     end
@@ -288,7 +297,10 @@ module Cuprite
 
             tv = @scores[tobj][t]
             if tv.nil?
-              raise CommandError, "operation #{operation} on unset target #{t}" if strict && operation != "="
+              # The game starts an unset target at 0. Cuprite's own slots never
+              # rely on that, so strict mode flags it as a compiler bug.
+              compiler_slot = tobj.end_with?(".vars", ".rt", ".globals")
+              raise CommandError, "operation #{operation} on unset target #{t}" if strict && compiler_slot && operation != "="
 
               tv = 0
             end
