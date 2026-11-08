@@ -340,6 +340,21 @@ class TestCore < Minitest::Test
     compile("p \"x\"")
   end
 
+  def test_unused_logical_right_operand
+    assert_same_output(<<~RUBY)
+      true && p("x")
+      false || p("y")
+      false && p("not printed")
+      true || p("not printed")
+      c = true
+      c && (c = false)
+      p c
+      n = nil
+      n || puts("n is nil")
+    RUBY
+    assert_compile_error(/returns a String/, "x = (true && p(\"z\"))")
+  end
+
   def test_inspect_escapes_interpolated_literals
     assert_same_output(<<~'RUBY')
       p "a#{"q\"\\"}b"

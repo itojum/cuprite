@@ -16,7 +16,7 @@ module Cuprite
       raise ConfigError, "#{path}: expected a mapping" unless data.is_a?(Hash)
 
       new(data, root: File.dirname(File.expand_path(path)))
-    rescue Psych::SyntaxError => e
+    rescue Psych::Exception => e # syntax errors, disallowed classes (e.g. dates), aliases
       raise ConfigError, "#{path}: #{e.message}"
     end
 

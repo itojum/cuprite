@@ -186,4 +186,14 @@ class TestSimulator < Minitest::Test
     err = assert_raises(Cuprite::Simulator::CommandError) { sim.run_function("s:loop") }
     assert_match "Ruby stack depth", err.message
   end
+
+  def test_store_score_holders_resolved_at_store_subcommand
+    sim = sim_with({})
+    player = sim.spawn("player")
+    sim.set_score(player, "o", 1)
+    sim.command("scoreboard objectives add r dummy")
+    sim.command("execute store result score @a[scores={o=1}] r run scoreboard players set @a o 7")
+    assert_equal 7, sim.score(player, "r")
+  end
 end
+
