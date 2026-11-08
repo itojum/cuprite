@@ -50,12 +50,15 @@ module Cuprite
     Print = instr(:lines)
     # Return src from the current function.
     Return = instr(:src)
+    # dst = fn(args...) for a user method.
+    Call = instr(:dst, :fn, :args)
 
     # --- Program structure -------------------------------------------------
 
     class Function
       attr_reader :name, :kind, :params, :line, :locals, :maybe_unassigned
-      attr_accessor :body
+      # Literal default values of optional parameters (nil for required ones).
+      attr_accessor :body, :defaults
 
       # kind: :main, :method, :on_load or :on_tick
       def initialize(name, kind:, params: [], line: nil)
@@ -68,6 +71,7 @@ module Cuprite
         # Locals that may be read before being assigned; they read as nil and
         # are reset on entry.
         @maybe_unassigned = Set.new
+        @defaults = []
         @temp_count = 0
       end
 

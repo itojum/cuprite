@@ -22,7 +22,8 @@ module Cuprite
 
     attr_reader :names, :constants
 
-    def initialize(program, types, names, pack, test_mode: false)
+    def initialize(program, types, names, pack, test_mode: false, file: nil)
+      @file = file
       @program = program
       @types = types
       @names = names
@@ -33,6 +34,7 @@ module Cuprite
     end
 
     def generate
+      @calls = CallGraph.new(@program)
       @program.functions.each_value { |fn| generate_function(fn) }
     end
 
@@ -159,13 +161,14 @@ module Cuprite
       when IR::If then compile_if(ins, out)
       when IR::Print then print(ins, out)
       when IR::Return then compile_return(ins, out)
+      when IR::Call then call(ins, out)
       else
         raise Error, "codegen: unsupported instruction #{ins.class}"
       end
     end
 
     def error(message)
-      raise CompileError.new(message, line: @line)
+      raise CompileError.new(message, file: @file, line: @line)
     end
 
     def types_of(operand) = @types.of(operand)
@@ -200,6 +203,52 @@ module Cuprite
     def compile_return(ins, out)
       move(:ret, ins.src, out) unless @fn.entry_point?
       out << unwind
+    end
+
+    # --- Calls -------------------------------------------------------------
+
+    def call(ins, out)
+      callee = @program.functions.fetch(ins.fn)
+      recursive = @calls.recursive_call?(@fn.name, callee.name)
+      # Save first: in a self-call the parameters being assigned are this
+      # frame's own.
+      saved = recursive ? save_locals(ins, out) : []
+      callee.params.zip(ins.args).each { |param, arg| move(param, arg, out) }
+      out << "function #{names.function(function_path(callee.name))}"
+      restore_locals(saved, out) if recursive
+      ret_type = @types.return_type(callee.name)
+      if ret_type == Set[:nil]
+        out << "scoreboard players reset #{ref(ins.dst)}"
+      elsif ret_type.include?(:nil)
+        out << "scoreboard players reset #{ref(ins.dst)}"
+        out << "execute if score #{ref(:ret)} matches #{ANY} run scoreboard players operation #{ref(ins.dst)} = #{ref(:ret)}"
+      else
+        move_raw(ins.dst, :ret, out)
+      end
+    end
+
+    # Pushes this frame's locals onto the storage stack before a call that
+    # may re-enter the current function (design §5). Unset locals are left
+    # out of the frame and come back unset.
+    def save_locals(ins, out)
+      locals = (@fn.locals.to_a - [ins.dst]).sort_by(&:name)
+      stack = "#{names.storage} stack"
+      out << "data modify storage #{stack} append value {}"
+      locals.each_with_index do |v, i|
+        out << "execute if score #{ref(v)} matches #{ANY} store result storage #{stack}[-1].v#{i} int 1 " \
+               "run scoreboard players get #{ref(v)}"
+      end
+      locals
+    end
+
+    def restore_locals(locals, out)
+      stack = "#{names.storage} stack"
+      locals.each_with_index do |v, i|
+        out << "scoreboard players reset #{ref(v)}" if @types.nilable?(v)
+        out << "execute if data storage #{stack}[-1].v#{i} store result score #{ref(v)} " \
+               "run data get storage #{stack}[-1].v#{i}"
+      end
+      out << "data remove storage #{stack}[-1]"
     end
 
     # --- Arithmetic --------------------------------------------------------

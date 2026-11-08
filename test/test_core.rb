@@ -365,5 +365,10 @@ class TestCore < Minitest::Test
   def test_errors_report_line
     e = assert_compile_error(/outside/, "x = 1\n\ny = 9999999999")
     assert_equal 3, e.line
+    e = assert_compile_error(/both Integer/, "x = 1\nx = true")
+    assert_equal 2, e.line
+    e = assert_compile_error(/only defined for Integers/, "b = true\np b + 1")
+    assert_equal 2, e.line
+    assert_equal "test.rb", e.file
   end
 end

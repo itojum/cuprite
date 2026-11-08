@@ -13,13 +13,31 @@ module Cuprite
       @file = file
     end
 
+    # Kernel control constructs (design §9.0) and built-ins that user
+    # methods may not shadow (design §4.5).
+    RESERVED = %w[main wait sleep next_tick wait_until as at positioned rotated execute
+                  puts p raise loop].freeze
+
     def build(root)
       @program = IR::Program.new
       main = IR::Function.new("main", kind: :main, line: 1)
       @program.add_function(main)
+      @defs = {}
+      root.statements.body.each { |stmt| declare_method(stmt) if stmt.is_a?(Prism::DefNode) }
+
       with_function(main) do
         compile_body(root.statements, used: false)
         emit IR::Return.new(src: IR::Const.nil)
+      end
+      @defs.each do |name, node|
+        fn = @program.functions.fetch(name)
+        with_function(fn) do
+          @line = node.location.start_line
+          value = compile_method_body(node.body)
+          # A body that always returns has no implicit return; emitting one
+          # would feed an unreachable value into return-type inference.
+          emit IR::Return.new(src: value) unless @terminated
+        end
       end
       @program
     end
@@ -29,13 +47,14 @@ module Cuprite
     # --- Context -----------------------------------------------------------
 
     def with_function(fn)
-      saved = [@fn, @block, @assigned]
+      saved = [@fn, @block, @assigned, @terminated]
       @fn = fn
       @block = fn.body
       @assigned = Set.new(fn.params)
+      @terminated = false
       yield
     ensure
-      @fn, @block, @assigned = saved
+      @fn, @block, @assigned, @terminated = saved
     end
 
     # Emits into `block` while the given block runs.
@@ -59,20 +78,146 @@ module Cuprite
       raise CompileError.new(message, file: @file, line: line)
     end
 
-    # Compiles a branch into a new block, tracking definite assignment.
-    # Returns [block, locals assigned in it].
+    # Compiles a branch into a new block, tracking definite assignment and
+    # whether the branch always returns. Returns [block, locals assigned in
+    # it, terminated]. A branch that always returns is treated as having
+    # assigned everything, since code after it only runs via the other path.
     def branch
       before = @assigned
+      outer_terminated = @terminated
       @assigned = before.dup
+      @terminated = false
       block = into([]) { yield }
       assigned = @assigned
+      terminated = @terminated
       @assigned = before
-      [block, assigned]
+      @terminated = outer_terminated
+      [block, assigned, terminated]
+    end
+
+    # Locals definitely assigned after two alternative branches.
+    def merge_assigned(a, a_term, b, b_term)
+      return b if a_term
+      return a if b_term
+
+      a & b
     end
 
     # Prism renamed `consequent` to `subsequent`; support both.
     def subsequent(node)
       node.respond_to?(:subsequent) ? node.subsequent : node.consequent
+    end
+
+    # --- Methods -----------------------------------------------------------
+
+    def declare_method(node)
+      @line = node.location.start_line
+      name = node.name.to_s
+      error("methods with a receiver (def self.#{name}) are not supported", node) if node.receiver
+      if RESERVED.include?(name) || name.start_with?("__")
+        error("'#{name}' is reserved and cannot be defined as a method", node)
+      end
+      error("method '#{name}' is defined twice", node) if @defs.key?(name)
+
+      kind = { "on_load" => :on_load, "on_tick" => :on_tick }.fetch(name, :method)
+      params, defaults = method_params(node, name)
+      error("#{name} cannot take parameters", node) if kind != :method && !params.empty?
+
+      fn = IR::Function.new(name, kind: kind, line: node.location.start_line)
+      params.each { |pname| fn.params << fn.local(pname) }
+      fn.defaults = defaults
+      @program.add_function(fn)
+      @defs[name] = node
+    end
+
+    # Required and optional parameters. Optional parameters need literal
+    # defaults, filled in by the caller.
+    def method_params(node, name)
+      ps = node.parameters
+      return [[], []] if ps.nil?
+
+      unsupported = ps.rest || !ps.posts.empty? || !ps.keywords.empty? || ps.keyword_rest || ps.block
+      error("#{name}: only required and optional positional parameters are supported", node) if unsupported
+
+      names = ps.requireds.map do |r|
+        error("#{name}: destructuring parameters are not supported", r) unless r.is_a?(Prism::RequiredParameterNode)
+
+        r.name.to_s
+      end
+      defaults = Array.new(names.size)
+      ps.optionals.each do |o|
+        scratch = IR::Function.new("(default)", kind: :method)
+        default = with_function(scratch) { compile_expr(o.value) }
+        # Defaults are filled in by the caller as constants, so anything that
+        # emits code (e.g. puts) would silently lose its side effects.
+        unless default.is_a?(IR::Const) && scratch.body.empty?
+          error("#{name}: default value of #{o.name} must be a literal", o)
+        end
+
+        names << o.name.to_s
+        defaults << default
+      end
+      [names, defaults]
+    end
+
+    def compile_method_body(body)
+      case body
+      when nil then IR::Const.nil
+      when Prism::BeginNode then compile_begin(body, used: true)
+      else compile_body(body, used: true)
+      end
+    end
+
+    def compile_begin(node, used:)
+      error("rescue / ensure are not supported yet", node) if node.rescue_clause || node.ensure_clause || node.else_clause
+
+      compile_body(node.statements, used: used)
+    end
+
+    def compile_return(node)
+      args = node.arguments&.arguments || []
+      error("returning several values is not supported", node) if args.size > 1
+      value = args.empty? ? IR::Const.nil : compile_expr(args.first)
+      value = IR::Const.nil if @fn.entry_point?
+      emit IR::Return.new(src: value)
+      @terminated = true
+      IR::Const.nil
+    end
+
+    def compile_method_call(node, name, args)
+      fn = @program.functions[name.to_s]
+      return nil if fn.nil? || fn.kind == :main
+
+      error("#{name} does not take a block", node) if node.block
+      min = fn.defaults.count(&:nil?)
+      unless args.size.between?(min, fn.params.size)
+        expected = min == fn.params.size ? min.to_s : "#{min}..#{fn.params.size}"
+        error("wrong number of arguments for #{name} (given #{args.size}, expected #{expected})", node)
+      end
+      ops = args.map do |a|
+        error("splat and keyword arguments are not supported", a) unless a.is_a?(Prism::Node) && !a.is_a?(Prism::SplatNode) && !a.is_a?(Prism::KeywordHashNode)
+
+        v = compile_expr(a)
+        # Snapshot each argument as it is evaluated: a later argument may
+        # change a variable an earlier one read (f(x, x = 2)). A self-call
+        # also assigns this frame's own parameters one by one, so there even
+        # the last argument must not be a parameter slot, and a setter's
+        # right-hand side is read again after the call as the expression's
+        # value, so the setter must not be able to change it.
+        last = a.equal?(args.last) && fn.name != @fn.name && !setter_assignment?(node)
+        last ? v : stable(v)
+      end
+      ops += fn.defaults[args.size..]
+      dst = @fn.temp
+      emit IR::Call.new(dst: dst, fn: fn.name, args: ops)
+      # Assignment syntax (self.x = v) evaluates to v, not the setter's result.
+      return ops.last if setter_assignment?(node)
+
+      dst
+    end
+
+    def setter_assignment?(node)
+      node.name.to_s.end_with?("=") && node.respond_to?(:attribute_write?) && node.attribute_write?
     end
 
     # --- Statements and expressions ---------------------------------------
@@ -85,7 +230,11 @@ module Cuprite
       stmts = node.is_a?(Prism::StatementsNode) ? node.body : [node]
       return IR::Const.nil if stmts.empty?
 
-      stmts[0..-2].each { |stmt| compile_expr(stmt, used: false) }
+      stmts[0..-2].each do |stmt|
+        compile_expr(stmt, used: false)
+        # Statements after an unconditional return never run.
+        return IR::Const.nil if @terminated
+      end
       compile_expr(stmts.last, used: used)
     end
 
@@ -122,6 +271,12 @@ module Cuprite
       when Prism::ElseNode then compile_body(node.statements, used: used)
       when Prism::CaseNode then compile_case(node, used: used)
       when Prism::CallNode then compile_call(node, used: used)
+      when Prism::DefNode
+        error("methods can only be defined at the top level", node) unless @fn.kind == :main && @block.equal?(@fn.body)
+
+        IR::Const.nil
+      when Prism::ReturnNode then compile_return(node)
+      when Prism::BeginNode then compile_begin(node, used: used)
       when Prism::StringNode, Prism::InterpolatedStringNode
         error("strings are only supported as arguments to puts, p and raise", node)
       else
@@ -253,16 +408,17 @@ module Cuprite
     def compile_if(predicate, then_node, else_node, used:, negate: false)
       cond = compile_expr(predicate)
       dst = used ? @fn.temp : nil
-      then_body, then_assigned = branch do
+      then_body, then_assigned, then_term = branch do
         v = compile_expr_or_nil(then_node, used: used)
-        emit IR::Move.new(dst: dst, src: v) if dst
+        emit IR::Move.new(dst: dst, src: v) if dst && !@terminated
       end
-      else_body, else_assigned = branch do
+      else_body, else_assigned, else_term = branch do
         v = compile_expr_or_nil(else_node, used: used)
-        emit IR::Move.new(dst: dst, src: v) if dst
+        emit IR::Move.new(dst: dst, src: v) if dst && !@terminated
       end
       then_body, else_body = else_body, then_body if negate
-      @assigned.merge(then_assigned & else_assigned)
+      @assigned.merge(merge_assigned(then_assigned, then_term, else_assigned, else_term))
+      @terminated ||= then_term && else_term
       # Both branches are tested against cond, so the first must not change it.
       cond = stable(cond) unless then_body.empty? || else_body.empty?
       emit IR::If.new(cond: cond, then_body: then_body, else_body: else_body)
@@ -281,19 +437,20 @@ module Cuprite
       build_when = lambda do |index|
         if index == whens.size
           v = else_node ? compile_body(else_node.statements, used: used) : IR::Const.nil
-          emit IR::Move.new(dst: dst, src: v) if dst
+          emit IR::Move.new(dst: dst, src: v) if dst && !@terminated
           next
         end
         w = whens[index]
         error("pattern matching (case/in) is not supported", w) unless w.is_a?(Prism::WhenNode)
 
         cond = when_condition(subject, w.conditions)
-        then_body, then_assigned = branch do
+        then_body, then_assigned, then_term = branch do
           v = compile_body(w.statements, used: used)
-          emit IR::Move.new(dst: dst, src: v) if dst
+          emit IR::Move.new(dst: dst, src: v) if dst && !@terminated
         end
-        else_body, else_assigned = branch { build_when.call(index + 1) }
-        @assigned.merge(then_assigned & else_assigned)
+        else_body, else_assigned, else_term = branch { build_when.call(index + 1) }
+        @assigned.merge(merge_assigned(then_assigned, then_term, else_assigned, else_term))
+        @terminated ||= then_term && else_term
         emit IR::If.new(cond: cond, then_body: then_body, else_body: else_body)
       end
       build_when.call(0)
@@ -410,11 +567,13 @@ module Cuprite
         end
       end
 
-      if recv.nil?
+      if recv.nil? || recv.is_a?(Prism::SelfNode)
         case name
         when :puts then return compile_print(node, args, :puts)
         when :p then return compile_print(node, args, :p, used: used)
         end
+        result = compile_method_call(node, name, args)
+        return result if result
       end
 
       error("undefined method '#{name}'", node)
