@@ -28,6 +28,19 @@ module Cuprite
       end
     end
 
+    # Raised by `return run function ...` so the call runs in place of the
+    # current frame (the game runs functions without growing a native stack).
+    class TailCall < StandardError
+      attr_reader :id, :args, :ctx
+
+      def initialize(id, args, ctx)
+        @id = id
+        @args = args
+        @ctx = ctx
+        super("tail call")
+      end
+    end
+
     Entity = Struct.new(:uuid, :type, :name, :tags, :pos, :rot, :alive, :online, keyword_init: true) do
       def player? = type == "player"
     end
@@ -124,8 +137,24 @@ module Cuprite
       execute_line(line, context || server_context)
     end
 
-    # Returns [returned?, value]
+    # Runs a function; returns its return value, or nil if it fell through.
     def call_function(id, macro_args, ctx)
+      tail = false
+      loop do
+        run_lines(id, macro_args, ctx)
+        # `return run function f` where f falls through returns 0.
+        return tail ? 0 : nil
+      rescue ReturnSignal => e
+        return e.value
+      rescue TailCall => t
+        id = t.id
+        macro_args = t.args
+        ctx = t.ctx
+        tail = true
+      end
+    end
+
+    def run_lines(id, macro_args, ctx)
       lines = @functions[id] or raise CommandError, "unknown function #{id}"
       lines.each do |line|
         if line.start_with?("$")
@@ -139,9 +168,6 @@ module Cuprite
         end
         execute_line(line, ctx)
       end
-      nil
-    rescue ReturnSignal => e
-      e.value
     end
 
     private
@@ -563,6 +589,12 @@ module Cuprite
         (@tags[id[1..]] || []).each { |f| call_function(f, nil, ctx) }
         return [true, 1]
       end
+      args = function_args(r)
+      v = call_function(id, args, ctx)
+      v.nil? ? [true, 0] : [v != 0, v]
+    end
+
+    def function_args(r)
       args = nil
       unless r.eof?
         raise CommandError, "expected 'with'" unless r.word == "with"
@@ -573,14 +605,21 @@ module Cuprite
         args = path ? nbt_get(@storage[sid], path) : @storage[sid]
         raise CommandError, "macro arguments are not a compound" unless args.is_a?(Hash)
       end
-      v = call_function(id, args, ctx)
-      v.nil? ? [true, 0] : [v != 0, v]
+      args
     end
 
     def cmd_return(r, ctx)
       token = r.word
       case token
       when "run"
+        if r.peek == "function" && !r.rest_peek.include?("#")
+          r.word
+          @commands_run += 1
+          raise ChainLimit if @commands_run > @chain_limit
+
+          id = r.word
+          raise TailCall.new(id, function_args(r), ctx)
+        end
         s, v = execute_line(r.rest, ctx)
         raise ReturnSignal, (s ? v : 0)
       when "fail" then raise ReturnSignal, 0
@@ -797,6 +836,11 @@ module Cuprite
         Integer(w)
       rescue ArgumentError
         raise CommandError, "expected integer, got #{w}"
+      end
+
+      def rest_peek
+        skip_ws
+        @s[@pos..]
       end
 
       def rest

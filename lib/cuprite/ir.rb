@@ -48,6 +48,12 @@ module Cuprite
     # Prints lines. Each line is an Array of parts: a String, or
     # [operand, :to_s | :inspect].
     Print = instr(:lines)
+    # Repeats body until a Break (or an unwind) leaves it.
+    Loop = instr(:body)
+    # Leaves the innermost Loop.
+    Break = instr()
+    # Starts the next iteration of the innermost Loop.
+    Next = instr()
     # Return src from the current function.
     Return = instr(:src)
     # dst = fn(args...) for a user method.
