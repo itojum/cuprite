@@ -151,6 +151,15 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
   `execute as <entities with an active task> at @s run function <ns>:__resume/...`.
   A single shared "has active task" score is scanned once, then dispatched
   per function.
+- **Execution context on resume**: the resume call re-applies, outermost
+  first, the subcommands of every context block (§9.3) that statically
+  encloses the suspension point, after the innermost `as` (whose entity holds
+  the task state). For example, a task suspended inside
+  `as("@a") { positioned("~ ~5 ~") { rotated("0 0") { ... } } }` resumes via
+  `execute as <entity> at @s positioned ~ ~5 ~ rotated 0 0 run function ...`.
+  Absolute coordinates are restored exactly; relative ones (`~`, `^`) and
+  selectors are re-evaluated against the state at resume time, consistent with
+  re-evaluating `at @s` each tick. No extra state is stored.
 - Entity selectors never match fake score holders, so tasks without an
   executing entity have a separate dispatch path, run as the server:
   `execute if score $server cuprite.pc.<fn> matches 1.. run function <ns>:__resume/<fn>`
