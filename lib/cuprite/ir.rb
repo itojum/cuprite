@@ -69,8 +69,8 @@ module Cuprite
     # raise klass, message
     Raise = instr(:klass, :message)
     # begin body rescue ... else ... ensure ... end. rescues is an Array of
-    # RescueClause; flag / saved_ctl / saved_exc are scratch locals.
-    Try = instr(:body, :rescues, :else_body, :ensure_body, :flag, :flag2, :saved_ctl, :saved_exc)
+    # RescueClause; flag / flag2 / saved_* are scratch locals.
+    Try = instr(:body, :rescues, :else_body, :ensure_body, :flag, :flag2, :saved_ctl, :saved_exc, :saved_ret)
     RescueClause = Struct.new(:classes, :body)
     # dst = fn(args...) for a user method.
     Call = instr(:dst, :fn, :args)

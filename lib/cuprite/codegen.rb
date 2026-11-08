@@ -228,6 +228,10 @@ module Cuprite
       "{" + hash.map { |k, v| "#{k}:#{JSON.generate(v)}" }.join(",") + "}"
     end
 
+    def always_nil?(operand)
+      operand.is_a?(IR::Const) ? operand.value.nil? : types_of(operand) == Set[:nil]
+    end
+
     # Raises NoMethodError when operand is nil.
     def check_not_nil(operand, op, out)
       return unless @types.nilable?(operand)
@@ -250,8 +254,10 @@ module Cuprite
     #   ...
     #   return 1
     #
-    # With ensure, a wrapper runs TRY, saves $ctl / $exc, runs ENSURE with
-    # $ctl cleared, then restores them and keeps unwinding if TRY did.
+    # With ensure, a wrapper runs TRY, saves the pending state ($ctl, $exc,
+    # the exception's class/message and a pending return value in $ret), runs
+    # ENSURE with $ctl cleared, then restores that state and keeps unwinding
+    # if TRY did. An ensure that unwinds itself overrides the pending state.
     def compile_try(ins, out)
       try_lines = []
       body = compile_nested(ins.body)
@@ -283,14 +289,23 @@ module Cuprite
 
       ensure_lines = compile_nested(ins.ensure_body)
       ensure_fn = new_block_function(ensure_lines + ["return 0"])
+      st = names.storage
+      saved = "#{st} ensure_exc.b#{@block_count}"
       wrapper = [
         "execute store success score #{ref(ins.flag2)} if function #{try_fn}",
         "scoreboard players operation #{ref(ins.saved_ctl)} = #{rt(:ctl)}",
         "scoreboard players operation #{ref(ins.saved_exc)} = #{rt(:exc)}",
+        "data remove storage #{saved}",
+        "execute if data storage #{st} exc run data modify storage #{saved} set from storage #{st} exc",
+        "scoreboard players reset #{ref(ins.saved_ret)}",
+        "execute if score #{rt(:ret)} matches #{ANY} run scoreboard players operation #{ref(ins.saved_ret)} = #{rt(:ret)}",
         "scoreboard players set #{rt(:ctl)} 0",
         "execute if function #{ensure_fn} run return 1",
         "scoreboard players operation #{rt(:ctl)} = #{ref(ins.saved_ctl)}",
         "scoreboard players operation #{rt(:exc)} = #{ref(ins.saved_exc)}",
+        "execute if data storage #{saved} run data modify storage #{st} exc set from storage #{saved}",
+        "scoreboard players reset #{rt(:ret)}",
+        "execute if score #{ref(ins.saved_ret)} matches #{ANY} run scoreboard players operation #{rt(:ret)} = #{ref(ins.saved_ret)}",
         "execute if score #{ref(ins.flag2)} matches 1 run return 1",
         "return 0"
       ]
@@ -380,6 +395,8 @@ module Cuprite
         case ins
         when IR::Next then true
         when IR::If then has_next?(ins.then_body) || has_next?(ins.else_body)
+        when IR::Try
+          [ins.body, *ins.rescues.map(&:body), ins.else_body, ins.ensure_body].any? { |b| has_next?(b) }
         else false
         end
       end
@@ -661,6 +678,9 @@ module Cuprite
 
       check_not_nil(a, op, out)
       check_not_nil(b, op, out) unless b == a
+      # An operand that is always nil has raised unconditionally above.
+      return if always_nil?(a) || always_nil?(b)
+
       if %i[/ %].include?(op)
         if b.is_a?(IR::Const)
           return out << raise_command("ZeroDivisionError", "divided by 0") if b.value.zero?
@@ -754,6 +774,8 @@ module Cuprite
         end
         check_not_nil(a, op, out)
         check_not_nil(b, op, out)
+        return if always_nil?(a) || always_nil?(b)
+
         if b.is_a?(IR::Const)
           if a.is_a?(IR::Const)
             return set_bool(dst, a.value.public_send(op, b.value), out)

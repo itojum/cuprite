@@ -81,7 +81,9 @@ module Cuprite
       when IR::Command then add(ins.dst, [:int]) if ins.dst
       when IR::Score then add(ins.dst, %i[int nil]) if ins.op == :get
       when IR::Exec then [ins.pending, ins.pending_exc].each { |v| add(v, [:int]) }
-      when IR::Try then [ins.flag, ins.flag2, ins.saved_ctl, ins.saved_exc].each { |v| add(v, [:int]) }
+      when IR::Try
+        [ins.flag, ins.flag2, ins.saved_ctl, ins.saved_exc].each { |v| add(v, [:int]) }
+        add(ins.saved_ret, %i[int nil])
       when IR::Return then add_return(fn.name, fn.entry_point? ? [:nil] : of(ins.src))
       when IR::Call
         callee = @program.functions.fetch(ins.fn)

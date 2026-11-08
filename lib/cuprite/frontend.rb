@@ -397,7 +397,8 @@ module Cuprite
 
     def emit_try(body, rescues, else_body, ensure_body)
       emit IR::Try.new(body: body, rescues: rescues, else_body: else_body, ensure_body: ensure_body,
-                       flag: @fn.temp, flag2: @fn.temp, saved_ctl: @fn.temp, saved_exc: @fn.temp)
+                       flag: @fn.temp, flag2: @fn.temp, saved_ctl: @fn.temp, saved_exc: @fn.temp,
+                       saved_ret: @fn.temp)
     end
 
     # expr rescue fallback
