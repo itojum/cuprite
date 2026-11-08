@@ -349,14 +349,16 @@ end
 - **Detached blocks**: `as(selector, wait: false) { ... }` starts a task on
   each entity and returns immediately without waiting. An exception raised
   inside a detached block that is not rescued within the block is not
-  propagated to the caller; it is recorded as the last error. For example, a
-  skill that ignores re-triggering while it is active:
+  propagated to the caller; it is recorded as the last error.
+- **Re-launch is skipped**: a detached block is not started on an entity
+  where that same block's task is still active; that entity is silently
+  skipped (no `AlreadyRunningError`). This is the usual "cannot re-trigger
+  while active" behaviour, so a skill needs no extra code:
 
   ```ruby
   def on_tick
     as("@a[scores={hoge=20}]", wait: false) do
       skill
-    rescue Cuprite::AlreadyRunningError
     end
   end
   ```
