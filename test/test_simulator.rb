@@ -52,6 +52,18 @@ class TestSimulator < Minitest::Test
     assert_raises(Cuprite::Simulator::CommandError) { sim.run_function("s:f") }
   end
 
+  def test_tail_call_with_bad_macro_arguments_stops_the_caller
+    sim = sim_with("m" => ["$scoreboard players set y o $(v)"],
+                   "f" => ["scoreboard players set x o 1", "return run function s:m with storage s:a missing",
+                           "scoreboard players set x o 2"])
+    sim.command("data modify storage s:a v set value 3")
+    sim.strict = false
+    assert_equal 0, sim.run_function("s:f")
+    assert_equal 1, sim.score("x", "o")
+    sim.strict = true
+    assert_raises(Cuprite::Simulator::CommandError) { sim.run_function("s:f") }
+  end
+
   def test_macros
     sim = sim_with("m" => ["$scoreboard players set x o $(v)"])
     sim.command("data modify storage s:a args set value {v: 42}")
@@ -174,4 +186,14 @@ class TestSimulator < Minitest::Test
     err = assert_raises(Cuprite::Simulator::CommandError) { sim.run_function("s:loop") }
     assert_match "Ruby stack depth", err.message
   end
+
+  def test_store_score_holders_resolved_at_store_subcommand
+    sim = sim_with({})
+    player = sim.spawn("player")
+    sim.set_score(player, "o", 1)
+    sim.command("scoreboard objectives add r dummy")
+    sim.command("execute store result score @a[scores={o=1}] r run scoreboard players set @a o 7")
+    assert_equal 7, sim.score(player, "r")
+  end
 end
+

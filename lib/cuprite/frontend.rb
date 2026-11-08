@@ -329,8 +329,10 @@ module Cuprite
         # Snapshot each argument as it is evaluated: a later argument may
         # change a variable an earlier one read (f(x, x = 2)). A self-call
         # also assigns this frame's own parameters one by one, so there even
-        # the last argument must not be a parameter slot.
-        last = a.equal?(args.last) && fn.name != @fn.name
+        # the last argument must not be a parameter slot, and a setter's
+        # right-hand side is read again after the call as the expression's
+        # value, so the setter must not be able to change it.
+        last = a.equal?(args.last) && fn.name != @fn.name && !setter_assignment?(node)
         last ? v : stable(v)
       end
       ops += fn.defaults[args.size..]
@@ -397,8 +399,8 @@ module Cuprite
       when Prism::GlobalVariableAndWriteNode
         g = global(node.name)
         and_assign(g, g, node.value)
-      when Prism::AndNode then logical(:and, node.left, node.right)
-      when Prism::OrNode then logical(:or, node.left, node.right)
+      when Prism::AndNode then logical(:and, node.left, node.right, used: used)
+      when Prism::OrNode then logical(:or, node.left, node.right, used: used)
       when Prism::IfNode then compile_if(node.predicate, node.statements, subsequent(node), used: used)
       when Prism::UnlessNode then compile_if(node.predicate, node.statements, node_else_body(node), used: used, negate: true)
       when Prism::ElseNode then compile_body(node.statements, used: used)
@@ -527,16 +529,23 @@ module Cuprite
     # --- Control flow ------------------------------------------------------
 
     # a && b / a || b with Ruby's value semantics and short-circuiting.
-    def logical(kind, left, right)
-      dst = @fn.temp
-      emit IR::Move.new(dst: dst, src: compile_expr(left))
-      body, = branch { emit IR::Move.new(dst: dst, src: compile_expr(right)) }
+    # When the value is unused, the right operand is compiled for its side
+    # effects only and the left one just guards it.
+    def logical(kind, left, right, used: true)
+      if used
+        dst = @fn.temp
+        emit IR::Move.new(dst: dst, src: compile_expr(left))
+        body, = branch { emit IR::Move.new(dst: dst, src: compile_expr(right)) }
+      else
+        dst = compile_expr(left)
+        body, = branch { compile_expr(right, used: false) }
+      end
       if kind == :and
         emit IR::If.new(cond: dst, then_body: body, else_body: [])
       else
         emit IR::If.new(cond: dst, then_body: [], else_body: body)
       end
-      dst
+      used ? dst : IR::Const.nil
     end
 
     def compile_if(predicate, then_node, else_node, used:, negate: false)
