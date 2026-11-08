@@ -322,8 +322,10 @@ module Cuprite
     end
 
     def op_assign(slot, current, op, value_node)
-      value = compile_expr(value_node)
       error("unsupported operator #{op}=") unless ARITH_OPS.include?(op)
+
+      current = stable(current) unless pure?(value_node)
+      value = compile_expr(value_node)
 
       emit IR::Arith.new(dst: slot, op: op, a: current, b: value)
       @assigned << slot if slot.is_a?(IR::Local)
@@ -356,6 +358,28 @@ module Cuprite
     end
 
     def temp?(operand) = operand.is_a?(IR::Local) && operand.name.start_with?("%")
+
+    # Whether evaluating `node` cannot change any variable, so operands
+    # compiled before it need no snapshot (see #stable).
+    def pure?(node)
+      case node
+      when nil, Prism::NilNode, Prism::TrueNode, Prism::FalseNode, Prism::IntegerNode,
+           Prism::LocalVariableReadNode, Prism::GlobalVariableReadNode, Prism::StringNode
+        true
+      when Prism::ParenthesesNode then pure?(node.body)
+      when Prism::StatementsNode then node.body.all? { |n| pure?(n) }
+      when Prism::AndNode, Prism::OrNode then pure?(node.left) && pure?(node.right)
+      when Prism::InterpolatedStringNode
+        node.parts.all? { |part| part.is_a?(Prism::StringNode) || pure?(part.statements) }
+      when Prism::CallNode
+        args = node.arguments&.arguments || []
+        operator = (ARITH_OPS + COMPARE_OPS).include?(node.name) && args.size == 1
+        unary = %i[-@ +@ !].include?(node.name) && args.empty?
+        node.receiver && !node.block && (operator || unary) && pure?(node.receiver) && args.all? { |a| pure?(a) }
+      else
+        false
+      end
+    end
 
     # --- Control flow ------------------------------------------------------
 
@@ -472,7 +496,7 @@ module Cuprite
           when :* then x * y
           when :/ then y.zero? ? (return nil) : x.div(y)
           when :% then y.zero? ? (return nil) : x.modulo(y)
-          when :** then y.negative? || y > 64 ? (return nil) : x.pow(y, 1 << 32)
+          when :** then y.negative? ? (return nil) : x.pow(y, 1 << 32)
           end
       v &= 0xffff_ffff
       IR::Const.int(v >= 0x8000_0000 ? v - 0x1_0000_0000 : v)
@@ -493,7 +517,7 @@ module Cuprite
       recv = node.receiver
 
       if recv && ARITH_OPS.include?(name) && args.size == 1 && !node.block
-        a = compile_expr(recv)
+        a = compile_operand(recv, before: args.first)
         b = compile_expr(args.first)
         folded = fold(name, a, b)
         return folded if folded
@@ -503,7 +527,7 @@ module Cuprite
         return dst
       end
       if recv && COMPARE_OPS.include?(name) && args.size == 1
-        a = compile_expr(recv)
+        a = compile_operand(recv, before: args.first)
         b = compile_expr(args.first)
         dst = @fn.temp
         emit IR::Compare.new(dst: dst, op: name, a: a, b: b)
@@ -513,12 +537,20 @@ module Cuprite
         case name
         when :-@
           v = compile_expr(recv)
-          return int_literal(-v.value, node) if v.is_a?(IR::Const) && v.type == :int
+          folded = fold(:-, IR::Const.int(0), v)
+          return folded if folded
 
           dst = @fn.temp
           emit IR::Arith.new(dst: dst, op: :-, a: IR::Const.int(0), b: v)
           return dst
-        when :+@ then return compile_expr(recv)
+        when :+@
+          v = compile_expr(recv)
+          return v if v.is_a?(IR::Const) && v.type == :int
+
+          # x + 0: a plain copy, but type-checked like other arithmetic.
+          dst = @fn.temp
+          emit IR::Arith.new(dst: dst, op: :+, a: v, b: IR::Const.int(0))
+          return dst
         when :!
           dst = @fn.temp
           emit IR::Not.new(dst: dst, src: compile_expr(recv))
@@ -538,40 +570,62 @@ module Cuprite
       error("undefined method '#{name}'", node)
     end
 
+    # Compiles `node`, copying the result if evaluating `later` (compiled
+    # after it) could change the variable it reads.
+    def compile_operand(node, before:)
+      v = compile_expr(node)
+      pure?(before) ? v : stable(v)
+    end
+
     def compile_print(node, args, kind, used: false)
       error("#{kind} does not take a block", node) if node.block
       if kind == :puts
-        lines = args.empty? ? [[]] : args.map { |a| print_parts(a, :to_s) }
+        lines = args.empty? ? [[]] : print_args(args, :to_s)
         emit IR::Print.new(lines: lines)
         return IR::Const.nil
       end
 
-      lines = args.map { |a| print_parts(a, :inspect) }
+      lines = print_args(args, :inspect)
       emit IR::Print.new(lines: lines) unless lines.empty?
       return IR::Const.nil if args.empty? || !used
 
       error("p with several arguments returns an Array, which is not supported", node) if args.size > 1
-      lines.first.size == 1 && lines.first.first.is_a?(Array) ? lines.first.first.first : IR::Const.nil
+      unless lines.first.size == 1 && lines.first.first.is_a?(Array)
+        error("p with a String argument returns a String, which is not supported", node)
+      end
+      lines.first.first.first
+    end
+
+    # Printed lines for `args`. Values are read only when the Print runs, so
+    # a value is snapshotted if a later argument could change it.
+    def print_args(args, mode)
+      args.each_with_index.map do |a, i|
+        print_parts(a, mode, snapshot: !args[(i + 1)..].all? { |later| pure?(later) })
+      end
     end
 
     # Parts of one printed line for argument node `arg`.
-    def print_parts(arg, mode)
+    def print_parts(arg, mode, snapshot: false)
       case arg
       when Prism::StringNode
         [mode == :inspect ? arg.unescaped.inspect : arg.unescaped]
       when Prism::InterpolatedStringNode
         parts = []
         parts << '"' if mode == :inspect
-        arg.parts.each do |part|
+        arg.parts.each_with_index do |part, i|
           case part
           when Prism::StringNode
             parts << (mode == :inspect ? arg_inspect_inner(part.unescaped) : part.unescaped)
           when Prism::EmbeddedStatementsNode
             sub = part.statements&.body || []
             if sub.size == 1 && sub.first.is_a?(Prism::StringNode)
-              parts << sub.first.unescaped
+              str = sub.first.unescaped
+              parts << (mode == :inspect ? arg_inspect_inner(str) : str)
             else
-              parts << [compile_body(part.statements), :to_s]
+              v = compile_body(part.statements)
+              later_pure = arg.parts[(i + 1)..].all? { |q| q.is_a?(Prism::StringNode) || pure?(q.statements) }
+              v = stable(v) if snapshot || !later_pure
+              parts << [v, :to_s]
             end
           else
             error("unsupported string interpolation", part)
@@ -580,7 +634,8 @@ module Cuprite
         parts << '"' if mode == :inspect
         parts
       else
-        [[compile_expr(arg), mode]]
+        v = compile_expr(arg)
+        [[snapshot ? stable(v) : v, mode]]
       end
     end
 

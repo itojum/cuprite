@@ -18,11 +18,13 @@ module Cuprite
     INT_MIN = -2_147_483_648
     INT_MAX = 2_147_483_647
 
-    # Raised internally to unwind a function on `return`.
+    # Raised internally to unwind a function on `return`. `return 0` succeeds
+    # with value 0; `return fail` fails, so success is carried separately.
     class ReturnSignal < StandardError
-      attr_reader :value
+      attr_reader :success, :value
 
-      def initialize(value)
+      def initialize(success, value)
+        @success = success
         @value = value
         super("return")
       end
@@ -113,6 +115,11 @@ module Cuprite
     rescue ChainLimit
       @log << "chain limit reached in #{id}"
       nil
+    rescue SystemStackError
+      # Function calls recurse through Ruby methods, so very deep recursion
+      # exhausts Ruby's stack before the chain limit. Fail loudly rather than
+      # pretend the game truncated the run.
+      raise CommandError, "#{id}: function recursion exceeds the simulator's Ruby stack depth"
     end
 
     def server_context = Context.new(entity: nil, pos: [0, 0, 0], rot: [0, 0])
@@ -124,8 +131,16 @@ module Cuprite
       execute_line(line, context || server_context)
     end
 
-    # Returns [returned?, value]
+    # Runs a function and returns its return value, or nil if it did not return.
     def call_function(id, macro_args, ctx)
+      result = function_result(id, macro_args, ctx)
+      result && result[1]
+    end
+
+    private
+
+    # Runs a function; returns [success, value] if it returned, else nil.
+    def function_result(id, macro_args, ctx)
       lines = @functions[id] or raise CommandError, "unknown function #{id}"
       lines.each do |line|
         if line.start_with?("$")
@@ -141,15 +156,17 @@ module Cuprite
       end
       nil
     rescue ReturnSignal => e
-      e.value
+      [e.success, e.value]
     end
 
-    private
-
-    # Executes one command, returning its result [success, value].
-    def execute_line(line, ctx)
-      @commands_run += 1
-      raise ChainLimit if @commands_run > @chain_limit
+    # Executes one command, returning its result [success, value]. A command
+    # nested under `execute ... run` or `return run` is part of the same
+    # function command, so it is not charged to the chain budget again.
+    def execute_line(line, ctx, charge: true)
+      if charge
+        @commands_run += 1
+        raise ChainLimit if @commands_run > @chain_limit
+      end
 
       r = Reader.new(line)
       result = dispatch(r, ctx)
@@ -222,16 +239,16 @@ module Cuprite
         n = r.int
         raise CommandError, "#{op} amount out of range" if op != "set" && n.negative?
 
-        last = 0
-        holders.each do |h|
+        # The result is the sum of the resulting scores.
+        total = holders.sum do |h|
           cur = @scores[obj][h] || 0
-          last = @scores[obj][h] = case op
+          @scores[obj][h] = case op
                             when "set" then n
                             when "add" then wrap(cur + n)
                             else wrap(cur - n)
                             end
         end
-        [!holders.empty?, holders.size == 1 ? last : holders.size]
+        [!holders.empty?, wrap(total)]
       when "reset"
         holders = holders(r.word, ctx)
         if r.eof?
@@ -282,7 +299,8 @@ module Cuprite
             end
           end
         end
-        [true, targets.size]
+        # The result is the sum of the targets' resulting scores.
+        [true, wrap(targets.sum { |t| @scores[tobj][t] || 0 })]
       else
         raise CommandError, "bad scoreboard players #{op}"
       end
@@ -383,6 +401,10 @@ module Cuprite
     end
 
     def in_range?(v, range)
+      range.split("..").each do |bound|
+        next if bound.empty?
+        raise CommandError, "range bound #{bound} is not a 32-bit integer" unless Integer(bound).between?(-2**31, 2**31 - 1)
+      end
       if range.include?("..")
         lo, hi = range.split("..", 2)
         (lo.empty? || v >= lo.to_i) && (hi.nil? || hi.empty? || v <= hi.to_i)
@@ -394,50 +416,67 @@ module Cuprite
     # --- execute -----------------------------------------------------------
 
     def cmd_execute(r, ctxs)
-      origin = ctxs.first
-      stores = []
+      # Each branch is [context, stores]; a store's target is bound to the
+      # context current at its `store` subcommand, not the final one.
+      branches = ctxs.map { |c| [c, []] }
       until r.eof?
+        return [false, 0] if branches.empty?
+
         sub = r.word
         case sub
         when "run"
           rest = r.rest
-          results = ctxs.map { |c| [*execute_line(rest, c), c] }
-          return finish_execute(results, stores)
+          results = branches.map do |c, stores|
+            begin
+              s, v = execute_line(rest, c, charge: false)
+            rescue ReturnSignal => e
+              # `run return ...` still reports its result to the stores.
+              apply_stores(stores, e.success, e.value)
+              raise
+            end
+            apply_stores(stores, s, v)
+            [s, v]
+          end
+          return finish_execute(results)
         when "if", "unless"
           want = sub == "if"
           kind = r.word
           if kind == "function"
             id = r.word
-            ctxs = ctxs.select do |c|
-              v = call_function(id, nil, c)
-              ((!v.nil? && v != 0) == want)
+            passed, failed = branches.partition do |c, _|
+              res = function_result(id, nil, c)
+              (!res.nil? && res[0] && res[1] != 0) == want
             end
           else
             pos = r.pos
-            ctxs = ctxs.select do |c|
+            passed, failed = branches.partition do |c, _|
               r.pos = pos
               condition(kind, r, c) == want
             end
           end
-          if ctxs.empty?
-            # A failing final condition stores 0; one before `run` stores nothing.
-            stores.each { |st| apply_store(st, false, 0, origin) } if r.eof?
-            return [false, 0]
-          end
+          # A failing final condition stores 0; one before `run` stores nothing.
+          failed.each { |_, stores| apply_stores(stores, false, 0) } if r.eof?
+          branches = passed
+          return [false, 0] if branches.empty?
         when "store"
-          stores << parse_store(r)
+          st = parse_store(r)
+          branches.each { |c, stores| stores << [st, c] }
         when "as"
           sel = r.word
-          ctxs = ctxs.flat_map { |c| select(sel, c).map { |e| Context.new(entity: e, pos: c.pos, rot: c.rot) } }
+          branches = branches.flat_map do |c, stores|
+            select(sel, c).map { |e| [Context.new(entity: e, pos: c.pos, rot: c.rot), stores.dup] }
+          end
         when "at"
           sel = r.word
-          ctxs = ctxs.flat_map { |c| select(sel, c).map { |e| Context.new(entity: c.entity, pos: e.pos, rot: e.rot) } }
+          branches = branches.flat_map do |c, stores|
+            select(sel, c).map { |e| [Context.new(entity: c.entity, pos: e.pos, rot: e.rot), stores.dup] }
+          end
         when "positioned"
           coords = [r.word, r.word, r.word]
-          ctxs = ctxs.map { |c| Context.new(entity: c.entity, pos: resolve_pos(coords, c), rot: c.rot) }
+          branches = branches.map { |c, st| [Context.new(entity: c.entity, pos: resolve_pos(coords, c), rot: c.rot), st] }
         when "rotated"
           rot = [r.word, r.word]
-          ctxs = ctxs.map { |c| Context.new(entity: c.entity, pos: c.pos, rot: resolve_rot(rot, c)) }
+          branches = branches.map { |c, st| [Context.new(entity: c.entity, pos: c.pos, rot: resolve_rot(rot, c)), st] }
         when "facing", "align", "anchored", "in", "on", "summon"
           # Accepted but not modelled beyond parsing their arguments.
           skip_subcommand(sub, r)
@@ -446,7 +485,8 @@ module Cuprite
         end
       end
       # Condition-only execute: each passing context succeeds with result 1.
-      finish_execute(ctxs.map { |c| [true, 1, c] }, stores)
+      branches.each { |_, stores| apply_stores(stores, true, 1) }
+      finish_execute(branches.map { [true, 1] })
     end
 
     def skip_subcommand(sub, r)
@@ -479,13 +519,14 @@ module Cuprite
       rot.each_with_index.map { |c, i| c.start_with?("~") ? ctx.rot[i] + c[1..].to_f : c.to_f }
     end
 
-    def finish_execute(results, stores)
+    def finish_execute(results)
       return [false, 0] if results.empty?
 
-      results.each do |s, v, c|
-        stores.each { |st| apply_store(st, s, v, c) }
-      end
       [results.any? { |s, _| s }, results.sum { |_, v| v }]
+    end
+
+    def apply_stores(stores, success, value)
+      stores.each { |st, ctx| apply_store(st, success, value, ctx) }
     end
 
     def parse_store(r)
@@ -511,9 +552,24 @@ module Cuprite
       when :score
         holders(store[:holder], ctx).each { |h| @scores[objective(store[:objective])][h] = wrap(v) }
       when :storage
-        n = (v * store[:scale]).floor
-        n = %w[byte short int long].include?(store[:type]) ? wrap(n) : n
-        nbt_set(@storage[store[:id]], store[:path], n)
+        nbt_set(@storage[store[:id]], store[:path], nbt_number(store[:type], v * store[:scale]))
+      end
+    end
+
+    INT_BITS = { "byte" => 8, "short" => 16, "int" => 32, "long" => 64 }.freeze
+
+    # The game's Java casts: (float)/(double) keep fractions; integer types
+    # truncate toward zero, saturate to int (long for `long`), then narrow.
+    def nbt_number(type, x)
+      case type
+      when "double" then x.to_f
+      when "float" then [x].pack("f").unpack1("f")
+      else
+        bits = INT_BITS[type] or raise CommandError, "unsupported store type #{type}"
+        wide = bits == 64 ? 64 : 32
+        n = x.truncate.clamp(-(1 << (wide - 1)), (1 << (wide - 1)) - 1)
+        n &= (1 << bits) - 1
+        n >= (1 << (bits - 1)) ? n - (1 << bits) : n
       end
     end
 
@@ -573,18 +629,17 @@ module Cuprite
         args = path ? nbt_get(@storage[sid], path) : @storage[sid]
         raise CommandError, "macro arguments are not a compound" unless args.is_a?(Hash)
       end
-      v = call_function(id, args, ctx)
-      v.nil? ? [true, 0] : [v != 0, v]
+      function_result(id, args, ctx) || [true, 0]
     end
 
     def cmd_return(r, ctx)
       token = r.word
       case token
       when "run"
-        s, v = execute_line(r.rest, ctx)
-        raise ReturnSignal, (s ? v : 0)
-      when "fail" then raise ReturnSignal, 0
-      else raise ReturnSignal, Integer(token)
+        s, v = execute_line(r.rest, ctx, charge: false)
+        raise ReturnSignal.new(s, s ? v : 0)
+      when "fail" then raise ReturnSignal.new(false, 0)
+      else raise ReturnSignal.new(true, Integer(token))
       end
     end
 
@@ -905,17 +960,21 @@ module Cuprite
           q = @s[@i]
           @i += 1
           out = +""
-          while @i < @s.size && @s[@i] != q
-            if @s[@i] == "\\"
-              @i += 1
-              out << @s[@i]
-            else
-              out << @s[@i]
-            end
+          loop do
+            raise CommandError, "unterminated SNBT string" if @i >= @s.size
+
+            ch = @s[@i]
             @i += 1
+            return out if ch == q
+
+            if ch == "\\"
+              raise CommandError, "unterminated SNBT string" if @i >= @s.size
+
+              ch = @s[@i]
+              @i += 1
+            end
+            out << ch
           end
-          @i += 1
-          out
         end
 
         def bare

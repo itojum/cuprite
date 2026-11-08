@@ -269,13 +269,20 @@ module Cuprite
         unless b.is_a?(IR::Const) && b.value.is_a?(Integer) && b.value >= 0
           error("** needs a non-negative integer literal exponent")
         end
-        src = a
+        return set_int(dst, 1, out) if b.value.zero?
+
+        # Square-and-multiply over the exponent's bits, most significant
+        # first; the leading 1 bit is the initial copy of the base.
+        base = a
         if a == dst
           move(:scratch, a, out)
-          src = :scratch
+          base = :scratch
         end
-        out << "scoreboard players set #{ref(dst)} 1"
-        b.value.times { apply_op(dst, :*, src, out) }
+        move(dst, a, out) unless a == dst
+        b.value.to_s(2)[1..].each_char do |bit|
+          apply_op(dst, :*, dst, out)
+          apply_op(dst, :*, base, out) if bit == "1"
+        end
         return
       end
 
@@ -288,6 +295,8 @@ module Cuprite
         apply_op(dst, op, b, out)
       end
     end
+
+    def set_int(dst, value, out) = move(dst, IR::Const.int(value), out)
 
     def move_raw(dst, src, out)
       out << "scoreboard players operation #{ref(dst)} = #{ref(src)}"
@@ -319,7 +328,7 @@ module Cuprite
           when :* then a * b
           when :/ then b.zero? ? (return nil) : a.div(b)
           when :% then b.zero? ? (return nil) : a.modulo(b)
-          when :** then b.negative? || b > 64 ? (return nil) : a.pow(b, 1 << 32)
+          when :** then b.negative? ? (return nil) : a.pow(b, 1 << 32)
           end
       wrap(v)
     end
@@ -397,7 +406,14 @@ module Cuprite
              else
                "if score #{ref(a)} = #{ref(b)}"
              end
-      if negate && cond.scan(/(?:\A| )(?:if|unless) /).size == 1
+      if cond.scan(/(?:\A| )(?:if|unless) /).size > 1
+        # A failing condition before the last one stores nothing, so set the
+        # result first and overwrite it when every condition holds.
+        set_bool(dst, negate, out)
+        out << "execute #{cond} run scoreboard players set #{ref(dst)} #{negate ? 0 : 1}"
+        return
+      end
+      if negate
         cond = cond.start_with?("if ") ? cond.sub(/\Aif /, "unless ") : cond.sub(/\Aunless /, "if ")
         negate = false
       end
@@ -412,6 +428,8 @@ module Cuprite
         return set_bool(ins.dst, !v.nil? && (ins.lo.nil? || v >= ins.lo) && (ins.hi.nil? || v <= ins.hi), out)
       end
       return set_bool(ins.dst, false, out) if ins.lo && ins.hi && ins.lo > ins.hi
+      # No 32-bit score lies outside these (e.g. `...-2147483648`).
+      return set_bool(ins.dst, false, out) if (ins.hi && ins.hi < INT_MIN) || (ins.lo && ins.lo > INT_MAX)
 
       range = "#{ins.lo}..#{ins.hi}"
       range = ANY if range == ".."

@@ -32,4 +32,22 @@ class TestConfig < Minitest::Test
   def test_rejects_non_boolean_debug
     assert_raises(Cuprite::ConfigError) { Cuprite::Config.new({ "namespace" => "a", "debug" => "yes" }) }
   end
+
+  def test_rejects_dot_namespaces
+    # The namespace is a directory Pack#write removes recursively.
+    %w[. ..].each do |ns|
+      assert_raises(Cuprite::ConfigError) { Cuprite::Config.new({ "namespace" => ns }) }
+    end
+  end
+
+  def test_rejects_non_string_paths
+    [nil, 1, [], {}].each do |bad|
+      assert_raises(Cuprite::ConfigError) { Cuprite::Config.new({ "namespace" => "a", "entry" => bad }) }
+      assert_raises(Cuprite::ConfigError) { Cuprite::Config.new({ "namespace" => "a", "output" => bad }) }
+    end
+    assert_raises(Cuprite::ConfigError) { Cuprite::Config.new({ "namespace" => "a", "entry" => "" }) }
+    assert_raises(Cuprite::ConfigError) { Cuprite::Config.new({ "namespace" => "a", "world" => 3 }) }
+    assert_raises(Cuprite::ConfigError) { Cuprite::Config.new({ "namespace" => "a", "world" => "" }) }
+    assert_nil Cuprite::Config.new({ "namespace" => "a", "world" => nil }).world
+  end
 end

@@ -266,6 +266,87 @@ class TestCore < Minitest::Test
     assert_compile_error(/undefined method 'foo'/, "foo(1)")
   end
 
+  def test_power_by_squaring
+    assert_same_output(<<~RUBY)
+      x = 3
+      p x ** 0, x ** 1, x ** 2, x ** 5, x ** 13
+      x **= 7
+      p x
+    RUBY
+    out = run_mc(<<~RUBY)
+      x = 2
+      p x ** 31
+      y = 3
+      p y ** 1000001
+      p 3 ** 1000001
+    RUBY
+    assert_equal %w[-2147483648 -1295716605 -1295716605], out
+    lines = compile("y = 3\np y ** 2147483647").files.sum { |path, body| path.end_with?(".mcfunction") ? body.lines.size : 0 }
+    assert_operator lines, :<, 200
+  end
+
+  def test_operands_are_read_before_later_assignments
+    assert_same_output(<<~RUBY)
+      x = 1
+      x += (x = 2)
+      p x
+      $g = 1
+      $g += ($g = 2)
+      p $g
+      x = 1
+      p(x + (x = 2))
+      x = 1
+      p(x == (x = 2))
+      x = 1
+      p(x < (x = 2))
+      x = 1
+      p x, (x = 2)
+      x = 1
+      puts "\#{x} \#{x = 2}"
+      x = 1
+      p "\#{x}", (x = 3)
+    RUBY
+  end
+
+  def test_equality_of_disjoint_nilable_types
+    assert_same_output(<<~RUBY)
+      a = 1 if true
+      b = true if false
+      p a == b, a != b, b == a
+      n = 1 if false
+      p n == b, n != b
+    RUBY
+  end
+
+  def test_beginless_exclusive_range_at_int_min
+    assert_same_output(<<~RUBY)
+      x = 3 if true
+      p(case x when ...-2147483648 then 1 else 2 end)
+    RUBY
+  end
+
+  def test_unary_operators_on_extremes
+    out = run_mc(<<~RUBY)
+      p(-(-2147483648))
+      x = -2147483648
+      p(-x, +x, +3)
+    RUBY
+    assert_equal %w[-2147483648 -2147483648 -2147483648 3], out
+    assert_compile_error(/only defined for Integers/, "b = true\np(+b)")
+  end
+
+  def test_p_string_return_value_is_an_error
+    assert_compile_error(/returns a String/, "if p(\"x\")\n  puts 1\nend")
+    compile("p \"x\"")
+  end
+
+  def test_inspect_escapes_interpolated_literals
+    assert_same_output(<<~'RUBY')
+      p "a#{"q\"\\"}b"
+      puts "a#{"q\"\\"}b"
+    RUBY
+  end
+
   def test_errors_report_line
     e = assert_compile_error(/outside/, "x = 1\n\ny = 9999999999")
     assert_equal 3, e.line
