@@ -230,17 +230,15 @@ module Cuprite
       error("expected keyword arguments", node) unless node.is_a?(Prism::KeywordHashNode)
 
       node.elements.to_h do |assoc|
-        key = assoc.key
-        error("expected keyword arguments", assoc) unless assoc.is_a?(Prism::AssocNode) && key.is_a?(Prism::SymbolNode)
-        error("unknown keyword #{key.unescaped}", assoc) unless allowed.include?(key.unescaped)
-
-        [key.unescaped, assoc.value]
-      end.transform_values do |v|
-        case v
-        when Prism::SymbolNode then v.unescaped
-        when Prism::StringNode then v.unescaped
-        else v
+        error("expected keyword arguments", assoc) unless assoc.is_a?(Prism::AssocNode) && assoc.key.is_a?(Prism::SymbolNode)
+        key = assoc.key.unescaped
+        error("unknown keyword #{key}", assoc) unless allowed.include?(key)
+        value = assoc.value
+        unless value.is_a?(Prism::SymbolNode) || value.is_a?(Prism::StringNode)
+          error("#{key}: needs a string or symbol literal", value)
         end
+
+        [key, value.unescaped]
       end
     end
 
@@ -320,7 +318,8 @@ module Cuprite
       body = with_block_scope(block) do
         @loops << :context
         before = @assigned.dup
-        b = into([]) { compile_body(block.body, used: false) }
+        # Locals first assigned in the block start unset for each entity.
+        b = into([]) { block_body { compile_body(block.body, used: false) } }
         @assigned = before
         @loops.pop
         b

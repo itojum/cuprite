@@ -34,6 +34,13 @@ module Cuprite
 
     def nilable?(operand) = of(operand).include?(:nil)
 
+    # Types inferred so far. Unlike #of, an empty set means "not known yet",
+    # not nil: reading nil here would stick to the slot for good even when
+    # the value turns out to be an Integer once its source is visited.
+    def known(operand)
+      operand.is_a?(IR::Const) ? Set[operand.type] : @types.fetch(operand, EMPTY)
+    end
+
     def run
       loop do
         @changed = false
@@ -75,7 +82,7 @@ module Cuprite
     def visit(fn, ins)
       @line = ins.line
       case ins
-      when IR::Move then add(ins.dst, of(ins.src))
+      when IR::Move then add(ins.dst, known(ins.src))
       when IR::Arith then add(ins.dst, [:int])
       when IR::Compare, IR::InRange, IR::Not then add(ins.dst, [:bool])
       when IR::Command then add(ins.dst, [:int]) if ins.dst
@@ -84,11 +91,11 @@ module Cuprite
       when IR::Try
         [ins.flag, ins.flag2, ins.saved_ctl, ins.saved_exc].each { |v| add(v, [:int]) }
         add(ins.saved_ret, %i[int nil])
-      when IR::Return then add_return(fn.name, fn.entry_point? ? [:nil] : of(ins.src))
+      when IR::Return then add_return(fn.name, fn.entry_point? ? [:nil] : known(ins.src))
       when IR::Call
         callee = @program.functions.fetch(ins.fn)
-        callee.params.zip(ins.args).each { |param, arg| add(param, of(arg)) }
-        add(ins.dst, return_type(ins.fn))
+        callee.params.zip(ins.args).each { |param, arg| add(param, known(arg)) }
+        add(ins.dst, @returns.fetch(ins.fn, EMPTY))
       end
     end
 

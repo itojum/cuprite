@@ -245,6 +245,39 @@ class TestInterop < Minitest::Test
     assert_equal [1, 1], [sim.score(a, "deaths"), sim.score(b, "deaths")]
   end
 
+  def test_single_command_context_body_keeps_its_function_boundary
+    sim, = world(<<~RUBY)
+      as("@a") { Cuprite.command "return 1" }
+      as("@a") { Cuprite.command "tag @s add t" }
+      puts "after"
+    RUBY
+    sim.run_function("t:main")
+    assert_equal ["after"], output_lines(sim)
+    assert_equal 2, sim.log.count("tag @s add t")
+  end
+
+  def test_empty_context_body_still_runs_its_subcommands
+    pack = compile('execute("summon minecraft:pig") { }')
+    assert_equal ["execute summon minecraft:pig run function t:__b/1"], pack.function_lines("__body/main")
+  end
+
+  def test_block_locals_start_unset_for_each_entity
+    sim, = world(<<~RUBY)
+      as("@a") do
+        x = 1 if Cuprite.command("execute if entity @s[name=A]") == 1
+        p x
+      end
+    RUBY
+    sim.run_function("t:main")
+    assert_equal %w[1 nil], output_lines(sim)
+  end
+
+  def test_method_result_can_be_interpolated
+    sim, = world("def amount\n  3\nend\nCuprite.command \"give @p diamond \#{amount}\"")
+    sim.run_function("t:main")
+    assert_equal ["give @p diamond 3"], sim.log
+  end
+
   def test_errors
     assert_compile_error(/needs a block/, 'as("@a")')
     assert_compile_error(/string literal/, "x = 1\nas(x) { }")
@@ -256,5 +289,9 @@ class TestInterop < Minitest::Test
     assert_compile_error(/unknown scoreboard operation/, SCORES + 'Scores.kills.frob(target: "@s")')
     assert_compile_error(/only contain objective/, "class S < Cuprite::Scoreboard\n  def x; end\nend")
     assert_compile_error(/only Integers can be interpolated/, "b = true\nCuprite.command \"say \#{b}\"")
+    assert_compile_error(/literal "\$\("/, "n = 3\nCuprite.command \"say $(a0) \#{n}\"")
+    assert_compile_error(/expected keyword arguments/, SCORES + "Scores.kills.get(**{})")
+    assert_compile_error(/name: needs a string or symbol literal/, "class S < Cuprite::Scoreboard\n  objective :k, name: 1\nend")
+    assert_compile_error(/criteria: needs a string or symbol literal/, "class S < Cuprite::Scoreboard\n  objective :k, criteria: 1\nend")
   end
 end

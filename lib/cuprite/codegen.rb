@@ -487,6 +487,9 @@ module Cuprite
       ins.parts.each do |p|
         if p.is_a?(String)
           error("Cuprite.command needs a single-line command") if p.include?("\n")
+          # The command becomes a macro line, where literal "$(" would be
+          # read as a parameter.
+          error("Cuprite.command cannot contain literal \"$(\" when it interpolates values") if p.include?("$(")
           template << p
         elsif p.is_a?(IR::Const)
           template << p.value.to_s
@@ -558,7 +561,11 @@ module Cuprite
       raises = exec_raises?(ins)
       nexts = has_next?(ins.body)
       unless raises || nexts
-        call_block(ins.body, out, prefix)
+        # Always a function of its own, even for one command or none: a
+        # user command such as `return 1` must end only this entity's run,
+        # and the subcommands (e.g. `summon`) must run even if the body is
+        # empty.
+        out << "#{prefix} run function #{new_block_function(compile_nested(ins.body))}"
         return
       end
 
