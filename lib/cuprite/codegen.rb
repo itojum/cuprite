@@ -36,6 +36,8 @@ module Cuprite
       @test_mode = test_mode
       @constants = Set.new
       @block_count = 0
+      @exec_slots = 0
+      @live_storage = []
     end
 
     def generate
@@ -519,12 +521,18 @@ module Cuprite
         v = ins.value
         error("scoreboard #{ins.op} needs an Integer") if types_of(v).include?(:bool)
         check_not_nil(v, ins.op, out)
+        # A value known to be nil always raises (above); there is no
+        # operation to emit after that.
+        return if (v.is_a?(IR::Const) && v.value.nil?) || types_of(v) == Set[:nil]
+
         if v.is_a?(IR::Const)
           n = v.value
           case ins.op
           when :set then out << "scoreboard players set #{target} #{n}"
           when :add, :remove
-            n = -n if ins.op == :remove
+            # Negating INT_MIN wraps back to INT_MIN, which has no add/remove
+            # form: amounts must fit in a signed 32-bit integer.
+            n = wrap(-n) if ins.op == :remove
             out << if n == INT_MIN
                      "scoreboard players operation #{target} += #{const_ref(n)}"
                    elsif n >= 0
@@ -554,9 +562,19 @@ module Cuprite
         return
       end
 
-      body_fn = new_block_function(compile_nested(ins.body) + ["return 0"])
+      # The payload of the exception kept aside lives in storage, which is
+      # not part of a frame; a recursive call made from the body saves and
+      # restores it with the frame's locals (see #save_locals).
+      @exec_slots += 1
+      saved_exc = "#{names.storage} pending_exc.e#{@exec_slots}"
+      @live_storage << saved_exc if raises
+      body_lines = begin
+        compile_nested(ins.body)
+      ensure
+        @live_storage.pop if raises
+      end
+      body_fn = new_block_function(body_lines + ["return 0"])
       wrapper = ["function #{body_fn}"]
-      saved_exc = "#{names.storage} pending_exc.b#{@block_count}"
       if raises
         record = new_block_function([
           "scoreboard players set #{ref(ins.pending)} 1",
@@ -649,6 +667,9 @@ module Cuprite
         out << "execute if score #{ref(v)} matches #{ANY} store result storage #{stack}[-1].v#{i} int 1 " \
                "run scoreboard players get #{ref(v)}"
       end
+      @live_storage.each_with_index do |path, i|
+        out << "execute if data storage #{path} run data modify storage #{stack}[-1].s#{i} set from storage #{path}"
+      end
       locals
     end
 
@@ -658,6 +679,9 @@ module Cuprite
         out << "scoreboard players reset #{ref(v)}" if @types.nilable?(v)
         out << "execute if data storage #{stack}[-1].v#{i} store result score #{ref(v)} " \
                "run data get storage #{stack}[-1].v#{i}"
+      end
+      @live_storage.each_with_index do |path, i|
+        out << "execute if data storage #{stack}[-1].s#{i} run data modify storage #{path} set from storage #{stack}[-1].s#{i}"
       end
       out << "data remove storage #{stack}[-1]"
     end

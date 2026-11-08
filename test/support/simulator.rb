@@ -61,6 +61,11 @@ module Cuprite
           @tags["#{m[1]}:#{m[2]}"] = JSON.parse(content)["values"]
         end
       end
+      # Objectives the compiler owns (design §5): those Names gives each
+      # namespace of the pack. A user objective may end in ".vars" too.
+      @compiler_objectives = pack.files.keys.filter_map { |path| path[%r{\Adata/([^/]+)/}, 1] }.uniq
+                                 .reject { |ns| ns == "minecraft" }
+                                 .flat_map { |ns| ["#{ns}.vars", "#{ns}.rt", "#{ns}.globals"] }.to_set
       @objectives = {}
       @scores = Hash.new { |h, k| h[k] = {} } # objective => { holder => value }
       @storage = Hash.new { |h, k| h[k] = {} }
@@ -216,8 +221,18 @@ module Cuprite
         targets = select(r.word, ctx)
         op = r.word
         name = r.word
-        targets.each { |e| op == "add" ? (e.tags |= [name]) : e.tags.delete(name) }
-        return [!targets.empty?, targets.size]
+        # The result counts the entities whose tags actually changed.
+        changed = targets.count do |e|
+          if op == "add"
+            next false if e.tags.include?(name)
+
+            e.tags << name
+          else
+            !e.tags.delete(name).nil?
+          end
+        end
+
+        return [changed.positive?, changed]
       end
       [true, 1]
     end
@@ -256,6 +271,7 @@ module Cuprite
         obj = objective(r.word)
         n = r.int
         raise CommandError, "#{op} amount out of range" if op != "set" && n.negative?
+        raise CommandError, "#{op} amount #{n} is not a 32-bit integer" unless n.between?(INT_MIN, INT_MAX)
 
         last = 0
         holders.each do |h|
@@ -299,7 +315,7 @@ module Cuprite
             if tv.nil?
               # The game starts an unset target at 0. Cuprite's own slots never
               # rely on that, so strict mode flags it as a compiler bug.
-              compiler_slot = tobj.end_with?(".vars", ".rt", ".globals")
+              compiler_slot = @compiler_objectives.include?(tobj)
               raise CommandError, "operation #{operation} on unset target #{t}" if strict && compiler_slot && operation != "="
 
               tv = 0

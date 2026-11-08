@@ -233,7 +233,9 @@ module Cuprite
           arg.parts.map do |part|
             case part
             when Prism::StringNode then part.unescaped
-            when Prism::EmbeddedStatementsNode then compile_body(part.statements)
+            # Capture each value now so a later interpolation that assigns
+            # the same variable cannot change it.
+            when Prism::EmbeddedStatementsNode then stable(compile_body(part.statements))
             else error("unsupported string interpolation", part)
             end
           end
@@ -891,9 +893,11 @@ module Cuprite
       args = node.arguments&.arguments || []
       error("break with several values is not supported", node) if args.size > 1
       dst = @loops.last
-      if args.size == 1 && dst.is_a?(IR::Local)
-        v = compile_expr(args.first)
-        emit IR::Move.new(dst: dst, src: v) if dst
+      if args.size == 1
+        # Evaluate the argument even when the loop's value is unused: it can
+        # have side effects (e.g. `break Cuprite.command("...")`).
+        v = compile_expr(args.first, used: dst.is_a?(IR::Local))
+        emit IR::Move.new(dst: dst, src: v) if dst.is_a?(IR::Local)
       end
       emit IR::Break.new
       IR::Const.nil

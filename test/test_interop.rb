@@ -147,6 +147,104 @@ class TestInterop < Minitest::Test
     assert_equal "uncaught", sim.storage["t:__runtime"]["last_error"]["message"]
   end
 
+  def test_literal_nil_score_value_only_raises
+    pack = compile(SCORES + 'Scores.kills.add(nil, target: "$x")')
+    assert_equal ["return run function t:__raise/1"], pack.function_lines("__body/main")
+    sim, = world(SCORES + "begin\n  Scores.kills.set(nil, target: \"$x\")\nrescue NoMethodError\n  puts \"nil\"\nend")
+    sim.run_function("t:main")
+    assert_equal ["nil"], output_lines(sim)
+  end
+
+  def test_removing_int_min
+    sim, = world(SCORES + <<~RUBY)
+      Scores.kills.set(5, target: "$x")
+      Scores.kills.remove(-2147483648, target: "$x")
+      p Scores.kills.get(target: "$x")
+    RUBY
+    sim.run_function("t:main")
+    assert_equal ["-2147483643"], output_lines(sim)
+    refute sim.log.any? { |l| l.include?("2147483648") }
+  end
+
+  def test_simulator_rejects_out_of_range_amounts
+    sim = boot(SCORES)
+    assert_raises(Cuprite::Simulator::CommandError) { sim.command("scoreboard players add $x kills 2147483648") }
+  end
+
+  def test_interpolated_values_are_captured_in_order
+    sim, = world("n = 1\nCuprite.command \"say \#{n} \#{n = 2}\"\np n")
+    sim.run_function("t:main")
+    assert_equal ["say 1 2"], sim.log
+    assert_equal ["2"], output_lines(sim)
+  end
+
+  def test_break_argument_runs_when_loop_value_is_unused
+    sim, = world('loop { break Cuprite.command("say done") }')
+    sim.run_function("t:main")
+    assert_equal ["say done"], sim.log
+  end
+
+  def test_tag_result_counts_changed_entities
+    sim, = world(<<~RUBY)
+      p Cuprite.command("tag @a add t")
+      p Cuprite.command("tag @a add t")
+      p Cuprite.command("tag @a remove absent")
+      p Cuprite.command("tag @a remove t")
+    RUBY
+    sim.run_function("t:main")
+    assert_equal %w[2 0 0 2], output_lines(sim)
+  end
+
+  def test_user_objective_ending_in_vars_starts_at_zero
+    sim, = world(<<~RUBY)
+      class S < Cuprite::Scoreboard
+        objective :mana, name: "custom.vars"
+      end
+      n = 3
+      S.mana.add(n, target: "$h")
+      p S.mana.get(target: "$h")
+    RUBY
+    sim.run_function("t:main")
+    assert_equal ["3"], output_lines(sim)
+  end
+
+  def test_recursive_context_block_keeps_its_own_exception
+    sim, = world(<<~RUBY)
+      def m(d)
+        as("@a") do
+          if d == 0
+            raise "outer" if Cuprite.command("execute if entity @s[name=A]") == 1
+            m(1)
+          else
+            raise ArgumentError, "inner"
+          end
+        end
+      end
+      m(0)
+    RUBY
+    sim.run_function("t:main")
+    assert_equal({ "class" => "RuntimeError", "message" => "outer" }, sim.storage["t:__runtime"]["last_error"])
+  end
+
+  def test_next_inside_begin_in_context_block
+    sim, a, b = world(SCORES + <<~RUBY)
+      as("@a") do
+        begin
+          next if Cuprite.command("execute if entity @s[name=A]") == 1
+        ensure
+          Scores.deaths.set(1, target: "@s")
+        end
+        Scores.kills.set(1, target: "@s")
+      end
+      puts "after"
+    RUBY
+    sim.run_function("t:main")
+    assert_equal ["after"], output_lines(sim)
+    assert_nil sim.score(a, "kills")
+    assert_equal 1, sim.score(b, "kills")
+    assert_equal [1, 1], [sim.score(a, "deaths"), sim.score(b, "deaths")]
+  end
+
   def test_errors
     assert_compile_error(/needs a block/, 'as("@a")')
     assert_compile_error(/string literal/, "x = 1\nas(x) { }")
