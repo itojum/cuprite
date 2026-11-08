@@ -99,7 +99,7 @@ class TestMethods < Minitest::Test
       def sq(x) = x * x
       p sq(3)
     RUBY
-    refute pack.files.values.any? { |c| c.include?(" stack") }
+    refute pack.files.values.any? { |c| c.include?("stack append") }
   end
 
   def test_recursive_calls_use_the_stack

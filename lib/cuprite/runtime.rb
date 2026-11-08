@@ -13,6 +13,7 @@ module Cuprite
     end
 
     def generate
+      @codegen.helper(:truncated)
       hash = build_hash
       generate_debug
       generate_init(hash)
@@ -38,7 +39,10 @@ module Cuprite
         "scoreboard objectives add #{names.globals} dummy",
         "scoreboard objectives add #{rt} dummy",
         "execute unless score $debug #{rt} matches 0..1 run scoreboard players set $debug #{rt} #{@debug ? 1 : 0}",
-        "scoreboard players set $ctl #{rt} 0"
+        "execute if score $running #{rt} matches 1 run function #{names.function('__truncated')}",
+        "scoreboard players set $running #{rt} 0",
+        "scoreboard players set $ctl #{rt} 0",
+        "scoreboard players set $exc #{rt} 0"
       ]
       @codegen.constants.sort.each do |c|
         lines << "scoreboard players set #{names.const(c)} #{rt} #{c}"
@@ -58,9 +62,11 @@ module Cuprite
         "scoreboard players set $debug #{rt} 0",
         %(tellraw @a {"text":"[#{ns}] debug mode off"})
       ])
+      st = names.storage
       @pack.add_function("debug/last_error", [
-        %(execute unless data storage #{names.storage} last_error run return run tellraw @a {"text":"[#{ns}] no error recorded"}),
-        %(tellraw @a {"text":"[#{ns}] last error: ","extra":[{"nbt":"last_error","storage":"#{names.storage}"}]})
+        %(execute unless data storage #{st} last_error run return run tellraw @a {"text":"[#{ns}] no error recorded"}),
+        %(tellraw @a {"text":"[#{ns}] last error: ","extra":[{"nbt":"last_error.class","storage":"#{st}"},) +
+          %({"text":": "},{"nbt":"last_error.message","storage":"#{st}"}]})
       ])
     end
 

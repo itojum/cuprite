@@ -23,7 +23,12 @@ module Cuprite
       main = IR::Function.new("main", kind: :main, line: 1)
       @program.add_function(main)
       @defs = {}
-      root.statements.body.each { |stmt| declare_method(stmt) if stmt.is_a?(Prism::DefNode) }
+      root.statements.body.each do |stmt|
+        case stmt
+        when Prism::DefNode then declare_method(stmt)
+        when Prism::ClassNode then declare_class(stmt)
+        end
+      end
 
       with_function(main) do
         compile_body(root.statements, used: false)
@@ -151,10 +156,126 @@ module Cuprite
       end
     end
 
-    def compile_begin(node, used:)
-      error("rescue / ensure are not supported yet", node) if node.rescue_clause || node.ensure_clause || node.else_clause
+    # --- Exceptions (design §7) -------------------------------------------
 
-      compile_body(node.statements, used: used)
+    def declare_class(node)
+      @line = node.location.start_line
+      name = constant_name(node.constant_path)
+      superclass = node.superclass && constant_name(node.superclass)
+      unless superclass && @program.exceptions.known?(superclass)
+        error("only exception classes (subclasses of StandardError and friends) can be defined", node)
+      end
+      error("class #{name} is already defined", node) if @program.exceptions.known?(name)
+      error("exception classes cannot have a body", node) if node.body
+
+      @program.exceptions.define(name, superclass)
+    end
+
+    # "Foo" or "Cuprite::Foo" for a constant reference node.
+    def constant_name(node)
+      case node
+      when Prism::ConstantReadNode then node.name.to_s
+      when Prism::ConstantPathNode
+        parent = node.respond_to?(:parent) ? node.parent : nil
+        child = node.respond_to?(:name) ? node.name.to_s : node.child.name.to_s
+        parent ? "#{constant_name(parent)}::#{child}" : child
+      else error("expected a constant", node)
+      end
+    end
+
+    def exception_class(node)
+      name = constant_name(node)
+      error("unknown exception class #{name}", node) unless @program.exceptions.known?(name)
+      name
+    end
+
+    def compile_raise(node, args)
+      error("raise needs an exception class or message (re-raising is not supported)", node) if args.empty?
+      error("too many arguments for raise", node) if args.size > 2
+
+      first = args.first
+      klass, message =
+        case first
+        when Prism::StringNode then ["RuntimeError", first.unescaped]
+        when Prism::ConstantReadNode, Prism::ConstantPathNode then [exception_class(first), nil]
+        when Prism::CallNode
+          unless first.name == :new && first.receiver && (first.arguments.nil? || first.arguments.arguments.size <= 1)
+            error("raise needs an exception class or a string literal", first)
+          end
+
+          msg = first.arguments&.arguments&.first
+          [exception_class(first.receiver), msg && string_literal(msg)]
+        else error("raise needs an exception class or a string literal", first)
+        end
+      error("raise with a message needs an exception class first", node) if args.size == 2 && first.is_a?(Prism::StringNode)
+
+      message = string_literal(args[1]) if args.size == 2
+      emit IR::Raise.new(klass: klass, message: message || klass)
+      IR::Const.nil
+    end
+
+    def string_literal(node)
+      error("exception messages must be string literals", node) unless node.is_a?(Prism::StringNode)
+
+      node.unescaped
+    end
+
+    def compile_begin(node, used:)
+      if node.rescue_clause.nil? && node.ensure_clause.nil?
+        error("else without rescue is not supported", node) if node.else_clause
+        return compile_body(node.statements, used: used)
+      end
+
+      dst = used ? @fn.temp : nil
+      before = @assigned.dup
+      body, = branch do
+        v = compile_body(node.statements, used: used && node.else_clause.nil?)
+        emit IR::Move.new(dst: dst, src: v) if dst && node.else_clause.nil?
+      end
+      rescues = []
+      clause = node.rescue_clause
+      while clause
+        if clause.reference
+          error("rescue => variable is not supported", clause)
+        end
+        classes = clause.exceptions.map { |e| exception_class(e) }
+        classes = ["StandardError"] if classes.empty?
+        rbody, = branch do
+          v = compile_body(clause.statements, used: used)
+          emit IR::Move.new(dst: dst, src: v) if dst
+        end
+        rescues << IR::RescueClause.new(classes, rbody)
+        clause = subsequent(clause)
+      end
+      else_body, = branch do
+        if node.else_clause
+          v = compile_body(node.else_clause.statements, used: used)
+          emit IR::Move.new(dst: dst, src: v) if dst
+        end
+      end
+      @assigned = before
+      ensure_body = []
+      if node.ensure_clause
+        ensure_body = into([]) { compile_body(node.ensure_clause.statements, used: false) }
+      end
+      emit_try(body, rescues, else_body, ensure_body)
+      dst || IR::Const.nil
+    end
+
+    def emit_try(body, rescues, else_body, ensure_body)
+      emit IR::Try.new(body: body, rescues: rescues, else_body: else_body, ensure_body: ensure_body,
+                       flag: @fn.temp, flag2: @fn.temp, saved_ctl: @fn.temp, saved_exc: @fn.temp)
+    end
+
+    # expr rescue fallback
+    def compile_rescue_modifier(node, used:)
+      dst = @fn.temp
+      before = @assigned.dup
+      body, = branch { emit IR::Move.new(dst: dst, src: compile_expr(node.expression)) }
+      rbody, = branch { emit IR::Move.new(dst: dst, src: compile_expr(node.rescue_expression)) }
+      @assigned = before
+      emit_try(body, [IR::RescueClause.new(["StandardError"], rbody)], [], [])
+      used ? dst : IR::Const.nil
     end
 
     def compile_return(node)
@@ -250,6 +371,11 @@ module Cuprite
         IR::Const.nil
       when Prism::ReturnNode then compile_return(node)
       when Prism::BeginNode then compile_begin(node, used: used)
+      when Prism::RescueModifierNode then compile_rescue_modifier(node, used: used)
+      when Prism::ClassNode
+        error("classes can only be defined at the top level", node) unless @fn.kind == :main && @block.equal?(@fn.body)
+
+        IR::Const.nil
       when Prism::StringNode, Prism::InterpolatedStringNode
         error("strings are only supported as arguments to puts, p and raise", node)
       else
@@ -693,6 +819,7 @@ module Cuprite
         case name
         when :puts then return compile_print(node, args, :puts)
         when :p then return compile_print(node, args, :p, used: used)
+        when :raise then return compile_raise(node, args)
         when :loop
           error("loop needs a block", node) unless node.block.is_a?(Prism::BlockNode) && args.empty?
           return compile_loop_block(node.block, used: used)

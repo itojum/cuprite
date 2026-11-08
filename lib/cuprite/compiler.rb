@@ -1,6 +1,7 @@
 # frozen_string_literal: true
 
 require "prism"
+require_relative "exceptions"
 require_relative "ir"
 require_relative "frontend"
 require_relative "types"

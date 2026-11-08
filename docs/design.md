@@ -68,6 +68,9 @@ world: ~/.minecraft/saves/MyWorld   # optional; if set, the pack is also copied 
 - An integer literal outside the 32-bit range is a **compile error**.
 - Division and modulo by a non-constant divisor get a runtime zero check that
   raises `ZeroDivisionError`.
+- Arithmetic and ordering comparisons on a value whose type includes `nil`
+  get a runtime check that raises `NoMethodError` (as Ruby does for
+  `nil + 1`).
 - Representation: booleans are `0`/`1`; `nil` is an **unset score**.
   Type combinations that inference cannot represent (e.g. `Integer | true`)
   are compile errors.

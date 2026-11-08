@@ -56,6 +56,12 @@ module Cuprite
     Next = instr()
     # Return src from the current function.
     Return = instr(:src)
+    # raise klass, message
+    Raise = instr(:klass, :message)
+    # begin body rescue ... else ... ensure ... end. rescues is an Array of
+    # RescueClause; flag / saved_ctl / saved_exc are scratch locals.
+    Try = instr(:body, :rescues, :else_body, :ensure_body, :flag, :flag2, :saved_ctl, :saved_exc)
+    RescueClause = Struct.new(:classes, :body)
     # dst = fn(args...) for a user method.
     Call = instr(:dst, :fn, :args)
 
@@ -96,11 +102,12 @@ module Cuprite
     end
 
     class Program
-      attr_reader :functions, :globals
+      attr_reader :functions, :globals, :exceptions
 
       def initialize
         @functions = {}
         @globals = Set.new
+        @exceptions = ExceptionTable.new
       end
 
       def add_function(fn)
@@ -119,9 +126,11 @@ module Cuprite
     end
 
     def self.nested_blocks(ins)
-      ins.class.members.filter_map do |m|
-        v = ins[m]
-        v if v.is_a?(Array) && v.all? { |x| x.is_a?(Struct) }
+      case ins
+      when If then [ins.then_body, ins.else_body]
+      when Loop then [ins.body]
+      when Try then [ins.body, *ins.rescues.map(&:body), ins.else_body, ins.ensure_body]
+      else []
       end
     end
   end
