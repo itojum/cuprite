@@ -27,12 +27,13 @@ module Cuprite
       @root = root
       @namespace = data["namespace"] or raise ConfigError, "cuprite.yml: namespace is required"
       Names.new(@namespace) # validates
-      @entry = data.fetch("entry", "src/main.rb")
-      @output = data.fetch("output", "build")
+      @entry = path_setting(data, "entry", "src/main.rb")
+      @output = path_setting(data, "output", "build")
       @debug = data.fetch("debug", false)
       raise ConfigError, "cuprite.yml: debug must be true or false" unless [true, false].include?(@debug)
 
       @world = data["world"]
+      raise ConfigError, "cuprite.yml: world must be a non-empty path" unless @world.nil? || non_empty_string?(@world)
     end
 
     def entry_path = File.expand_path(entry, root)
@@ -45,5 +46,16 @@ module Cuprite
 
       File.join(File.expand_path(world, root), "datapacks", namespace)
     end
+
+    private
+
+    def path_setting(data, key, default)
+      value = data.fetch(key, default)
+      raise ConfigError, "cuprite.yml: #{key} must be a non-empty path" unless non_empty_string?(value)
+
+      value
+    end
+
+    def non_empty_string?(value) = value.is_a?(String) && !value.strip.empty?
   end
 end
