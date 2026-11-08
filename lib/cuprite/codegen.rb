@@ -45,11 +45,18 @@ module Cuprite
     end
 
     # Internal path of a method, used for calls from Ruby code. Entry points
-    # are wrapped (truncation detection, uncaught exceptions), so Ruby calls
-    # go to their body.
+    # and exported methods that may raise are wrapped (truncation detection,
+    # uncaught exceptions), so Ruby calls go to their body.
     def body_path(name)
-      @program.functions.fetch(name).entry_point? ? "__body/#{name}" : function_path(name)
+      wrapped?(name) ? "__body/#{name}" : function_path(name)
     end
+
+    def wrapped?(name)
+      @program.functions.fetch(name).entry_point? || (exported?(name) && may_raise?(name))
+    end
+
+    # Whether `name` is callable as /function <ns>:<name> (§4.5).
+    def exported?(name) = !function_path(name).start_with?("__")
 
     # Resource path of the function implementing Ruby method `name` (§4.5).
     def function_path(name)
@@ -140,7 +147,21 @@ module Cuprite
       lines.concat(compile_block(fn.body))
       lines.pop if lines.last == "return 0" && fn.entry_point?
       @pack.add_function(body_path(fn.name), lines)
-      generate_entry_wrapper(fn) if fn.entry_point?
+      if fn.entry_point?
+        generate_entry_wrapper(fn)
+      elsif wrapped?(fn.name)
+        generate_export_wrapper(fn)
+      end
+    end
+
+    # An exported method run as /function <ns>:<name> is an uncaught-error
+    # boundary too (§7): it records the exception and clears the halt flag.
+    # Its return value stays in $ret.
+    def generate_export_wrapper(fn)
+      @pack.add_function(function_path(fn.name), [
+        "function #{names.function(body_path(fn.name))}",
+        "execute if score #{rt(:ctl)} matches 4 run function #{helper(:uncaught)}"
+      ])
     end
 
     # <ns>:main, on_load, on_tick: detect a truncated previous run (§6.7),
@@ -283,7 +304,7 @@ module Cuprite
       ensure_lines = compile_nested(ins.ensure_body)
       ensure_fn = new_block_function(ensure_lines + ["return 0"])
       st = names.storage
-      saved = "#{st} ensure_exc.b#{@block_count}"
+      saved = ensure_slot(ins)
       wrapper = [
         "execute store success score #{ref(ins.flag2)} if function #{try_fn}",
         "scoreboard players operation #{ref(ins.saved_ctl)} = #{rt(:ctl)}",
@@ -303,6 +324,20 @@ module Cuprite
         "return 0"
       ]
       out << "execute if function #{new_block_function(wrapper)} run #{unwind}"
+    end
+
+    # Storage path holding the pending exception compound while `try`'s
+    # ensure runs. Recursive calls save it with the frame (see #save_locals).
+    def ensure_slot(try)
+      @ensure_slots ||= {}.compare_by_identity
+      @ensure_slots[try] ||= "#{names.storage} ensure_exc.e#{@ensure_slots.size + 1}"
+    end
+
+    # ensure slots of the current function, in a stable order.
+    def ensure_slots
+      slots = []
+      IR.each_instr(@fn.body) { |ins| slots << ensure_slot(ins) if ins.is_a?(IR::Try) && !ins.ensure_body.empty? }
+      slots
     end
 
     def compile_block(block)
@@ -522,6 +557,9 @@ module Cuprite
         out << "execute if score #{ref(v)} matches #{ANY} store result storage #{stack}[-1].v#{i} int 1 " \
                "run scoreboard players get #{ref(v)}"
       end
+      ensure_slots.each_with_index do |slot, i|
+        out << "execute if data storage #{slot} run data modify storage #{stack}[-1].e#{i} set from storage #{slot}"
+      end
       locals
     end
 
@@ -531,6 +569,10 @@ module Cuprite
         out << "scoreboard players reset #{ref(v)}" if @types.nilable?(v)
         out << "execute if data storage #{stack}[-1].v#{i} store result score #{ref(v)} " \
                "run data get storage #{stack}[-1].v#{i}"
+      end
+      ensure_slots.each_with_index do |slot, i|
+        out << "data remove storage #{slot}"
+        out << "execute if data storage #{stack}[-1].e#{i} run data modify storage #{slot} set from storage #{stack}[-1].e#{i}"
       end
       out << "data remove storage #{stack}[-1]"
     end

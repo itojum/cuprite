@@ -345,4 +345,44 @@ class TestExceptions < Minitest::Test
     assert_compile_error(/only exception classes/, "class Foo; end")
     assert_compile_error(/cannot have a body/, "class E < StandardError\n  def x; end\nend")
   end
+  def test_recursive_ensure_keeps_pending_exception_details
+    sim = boot(<<~RUBY)
+      def f(n)
+        begin
+          raise ArgumentError, "outer" if n == 0
+          raise "inner"
+        ensure
+          if n == 0
+            begin
+              f(1)
+            rescue
+            end
+          end
+        end
+      end
+      f(0)
+    RUBY
+    sim.run_function("t:main")
+    assert_equal({ "class" => "ArgumentError", "message" => "outer" }, sim.storage["t:__runtime"]["last_error"])
+  end
+
+  def test_exported_method_records_uncaught_exception
+    sim = boot(<<~RUBY)
+      def boom
+        raise ArgumentError, "boom"
+      end
+      def safe
+        boom
+      rescue ArgumentError
+        puts "rescued"
+      end
+      safe if $go
+      puts "main"
+    RUBY
+    sim.run_function("t:boom")
+    assert_equal({ "class" => "ArgumentError", "message" => "boom" }, sim.storage["t:__runtime"]["last_error"])
+    assert_equal 0, sim.score("$ctl", "t.rt")
+    sim.run_function("t:main")
+    assert_equal ["main"], output_lines(sim)
+  end
 end
