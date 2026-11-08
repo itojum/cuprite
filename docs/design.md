@@ -45,6 +45,12 @@ world: ~/.minecraft/saves/MyWorld   # optional; if set, the pack is also copied 
 
 - Tests compile Ruby programs, run them under **CRuby** and on a real
   **Minecraft 26.3 dedicated server** (driven over RCON), and compare outputs.
+- CRuby is only a valid oracle for programs whose arithmetic never leaves the
+  32-bit range: wrapping (§4.1) changes intermediate results, not just the
+  final output (`(2147483647 + 1) / 2` is `1073741824` in CRuby but
+  `-1073741824` in Cuprite). Differential tests are therefore restricted to
+  non-overflowing programs; wrapping behaviour is covered by separate tests
+  with hand-written expected outputs.
 - Tests run both in the development (cloud) environment and in **GitHub
   Actions**.
 - The server jar is downloaded from Mojang at test time. It is never committed
@@ -145,6 +151,11 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
   `execute as <entities with an active task> at @s run function <ns>:__resume/...`.
   A single shared "has active task" score is scanned once, then dispatched
   per function.
+- Entity selectors never match fake score holders, so tasks without an
+  executing entity have a separate dispatch path, run as the server:
+  `execute if score $server cuprite.pc.<fn> matches 1.. run function <ns>:__resume/<fn>`
+  (the fake player `$server` holds the state in the same per-function objectives)
+  for each suspendable function that can run without an entity.
 - Within a tick, `on_tick` runs first, then suspended tasks are resumed.
 - Entry points always start every tick; there is **no limit** on the number of
   concurrent tasks.
