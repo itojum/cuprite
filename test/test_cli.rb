@@ -49,4 +49,27 @@ class TestCLI < Minitest::Test
     assert_equal 2, status
     assert_match "usage", err
   end
+
+  def test_build_rejects_blank_entry_without_traceback
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "cuprite.yml"), "namespace: demo\nentry:\n")
+      status, _out, err = Dir.chdir(dir) { run_cli("build") }
+      assert_equal 1, status
+      assert_match "cuprite: cuprite.yml: entry", err
+    end
+  end
+
+  def test_build_rejects_dot_namespace_and_keeps_siblings
+    Dir.mktmpdir do |dir|
+      File.write(File.join(dir, "cuprite.yml"), "namespace: .\n")
+      Dir.mkdir(File.join(dir, "src"))
+      File.write(File.join(dir, "src/main.rb"), "nil\n")
+      FileUtils.mkdir_p(File.join(dir, "build/other"))
+      status, _out, err = Dir.chdir(dir) { run_cli("build") }
+      assert_equal 1, status
+      assert_match "namespace", err
+      assert File.directory?(File.join(dir, "build/other"))
+    end
+  end
 end
+

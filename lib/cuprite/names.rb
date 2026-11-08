@@ -12,6 +12,8 @@ module Cuprite
     def initialize(ns)
       raise ConfigError, "invalid namespace #{ns.inspect}" unless ns.is_a?(String) && ns.match?(NAMESPACE_PATTERN)
       raise ConfigError, "namespace #{ns.inspect} is reserved" if ns == "minecraft"
+      # The namespace is a directory name that Pack#write replaces recursively.
+      raise ConfigError, "invalid namespace #{ns.inspect}" if %w[. ..].include?(ns)
 
       @ns = ns
     end
