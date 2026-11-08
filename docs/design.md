@@ -182,8 +182,11 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
   (the fake player `$server` holds the state in the same per-function objectives)
   for each suspendable function that can run without an entity.
 - Within a tick, `on_tick` runs first, then suspended tasks are resumed.
-- Entry points always start every tick; there is **no limit** on the number of
-  concurrent tasks.
+- There is **no limit** on the number of concurrent tasks.
+- `on_tick` and `on_load` **cannot suspend**: reaching a wait from them is a
+  compile error, except inside `as(..., wait: false)` (§9.3). This guarantees
+  `on_tick` starts and finishes within every tick. Long-running processes are
+  started from them with `as(selector, wait: false) { ... }`.
 
 ### 6.3 Recursion and waits
 
@@ -194,7 +197,17 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
 
 - If a suspendable function is called on an entity that already has a running
   task for **the same function**, `Cuprite::AlreadyRunningError` is raised.
+  The same applies to the `$server` state holder (e.g. running
+  `/function <ns>:main` again while it is suspended). The existing task is
+  left intact.
 - Different functions may run concurrently on the same entity.
+- **Forking without changing the executor**: `at` and `execute` can fork
+  execution while keeping `@s`, so forks would share one task slot. Reaching
+  a wait inside an `at` / `execute` block is therefore a compile error unless
+  its selector is single-target (`@s`, `@p`, `@r`, or `limit=1`); a raw
+  `execute("...")` string counts as single-target only if it contains no
+  forking subcommand. The fix is `as(selector) { at("@s") { ... } }`, which
+  gives each entity its own task. `positioned` / `rotated` never fork.
 
 ### 6.5 Disappearing entities
 
@@ -314,6 +327,20 @@ end
   first exception raised is re-raised in the caller.
 - Blocks may read **and assign** outer local variables. Concurrent tasks
   assigning the same variable share one fake player.
+- **Detached blocks**: `as(selector, wait: false) { ... }` starts a task on
+  each entity and returns immediately without waiting. An exception raised
+  inside a detached block that is not rescued within the block is not
+  propagated to the caller; it is recorded as the last error. For example, a
+  skill that ignores re-triggering while it is active:
+
+  ```ruby
+  def on_tick
+    as("@a[scores={hoge=20}]", wait: false) do
+      skill
+    rescue Cuprite::AlreadyRunningError
+    end
+  end
+  ```
 
 ## Open facts to verify
 
