@@ -264,6 +264,8 @@ debug flag only if it is unset, and performs the build-hash check (§6.6).
 - No static exception analysis: users avoid unhandled errors with `rescue`.
 - An uncaught exception stops the task. It is printed only in debug mode, and
   is always recorded in storage, viewable with `/function <ns>:debug/last_error`.
+  Entry points and exported methods run with `/function <ns>:<name>` are
+  boundaries for this; calls from Ruby code are not.
 
 ## 8. Output and debug mode
 

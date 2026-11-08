@@ -50,4 +50,15 @@ class TestConfig < Minitest::Test
     assert_raises(Cuprite::ConfigError) { Cuprite::Config.new({ "namespace" => "a", "world" => "" }) }
     assert_nil Cuprite::Config.new({ "namespace" => "a", "world" => nil }).world
   end
+
+  def test_load_converts_safe_loader_errors
+    Dir.mktmpdir do |dir|
+      path = File.join(dir, "cuprite.yml")
+      File.write(path, "namespace: a\nentry: 2024-01-01\n")
+      assert_raises(Cuprite::ConfigError) { Cuprite::Config.load(path) }
+      File.write(path, "namespace: &n a\nentry: *n\n")
+      assert_raises(Cuprite::ConfigError) { Cuprite::Config.load(path) }
+    end
+  end
 end
+

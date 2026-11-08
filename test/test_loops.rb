@@ -169,7 +169,7 @@ class TestLoops < Minitest::Test
       (2147483646..2147483647).each { |i| p i }
       for x in -2147483648..-2147483647 do p x end
       (-2147483648...-2147483646).each { |i| p i }
-      p(-2147483648.upto(-2147483648) { |i| p i })
+      p((-2147483648).upto(-2147483648) { |i| p i })
     RUBY
   end
 

@@ -523,7 +523,7 @@ module Cuprite
           return [false, 0] if branches.empty?
         when "store"
           st = parse_store(r)
-          branches.each { |c, stores| stores << [st, c] }
+          branches.each { |c, stores| stores << [bind_store(st, c), c] }
         when "as"
           sel = r.word
           branches = branches.flat_map do |c, stores|
@@ -609,11 +609,20 @@ module Cuprite
       end
     end
 
+    # Score destinations are resolved when the store subcommand is parsed,
+    # before the run command can change which entities a selector matches.
+    def bind_store(store, ctx)
+      return store unless store[:kind] == :score
+
+      store.merge(holders: holders(store[:holder], ctx), objective: objective(store[:objective]))
+    end
+
     def apply_store(store, success, value, ctx)
       v = store[:what] == "success" ? (success ? 1 : 0) : value
       case store[:kind]
       when :score
-        holders(store[:holder], ctx).each { |h| @scores[objective(store[:objective])][h] = wrap(v) }
+        targets = store[:holders] || holders(store[:holder], ctx)
+        targets.each { |h| @scores[objective(store[:objective])][h] = wrap(v) }
       when :storage
         nbt_set(@storage[store[:id]], store[:path], nbt_number(store[:type], v * store[:scale]))
       end
@@ -707,7 +716,16 @@ module Cuprite
           # Part of this function command: not charged to the chain budget.
           r.word
           id = r.word
-          raise TailCall.new(id, function_args(r), ctx)
+          begin
+            args = function_args(r)
+          rescue CommandError
+            # Bad macro arguments fail the function command, so the
+            # `return run` returns 0 and this function stops here.
+            raise if strict
+
+            raise ReturnSignal.new(false, 0)
+          end
+          raise TailCall.new(id, args, ctx)
         end
         s, v = execute_line(r.rest, ctx, charge: false)
         raise ReturnSignal.new(s, s ? v : 0)
